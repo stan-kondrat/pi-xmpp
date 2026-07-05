@@ -217,6 +217,8 @@ export default function (pi: Pi.ExtensionAPI) {
     runtimeEvents.record(category, error ?? undefined, details);
   };
 
+  const getRuntimeEvents = () => runtimeEvents.getEvents();
+
   // --- Context store ---
   const sessionContextStore = Lifecycle.createXmppSessionContextStore<Pi.ExtensionContext>();
 
@@ -277,7 +279,10 @@ export default function (pi: Pi.ExtensionAPI) {
     if (route.isGroup) {
       // In groupchats: if no owner is configured, anyone can participate.
       // If an owner is configured, only their messages are processed.
-      if (ownerJid && route.fromBare !== ownerJid) return;
+      if (ownerJid && route.fromBare !== ownerJid) {
+        recordRuntimeEvent("auth-deny", null, { account: accountName, fromBare: route.fromBare, reason: "not owner in groupchat" });
+        return;
+      }
     } else {
       // Direct messages: use pairing/allow/deny
       const auth = Config.getXmppAuthorizationState(
@@ -285,10 +290,14 @@ export default function (pi: Pi.ExtensionAPI) {
         ownerJid,
       );
 
-      if (auth.kind === "deny") return;
+      if (auth.kind === "deny") {
+        recordRuntimeEvent("auth-deny", null, { account: accountName, fromBare: route.fromBare });
+        return;
+      }
 
       // Auto-pair if needed (first DM sender becomes owner)
       if (auth.kind === "pair") {
+        recordRuntimeEvent("auth-pair", null, { account: accountName, fromBare: route.fromBare });
         if (accountConfig) {
           accountConfig.ownerJid = route.fromBare;
           configStore.setActiveAccount(accountName);
@@ -404,6 +413,7 @@ export default function (pi: Pi.ExtensionAPI) {
     joinRoomOnAccount: clientManager.joinRoomOnAccount,
     leaveRoomOnAccount: clientManager.leaveRoomOnAccount,
     sendPresenceOnAccount: clientManager.sendPresenceOnAccount,
+    getRuntimeEvents,
   });
 
   for (const cmd of allCommands) {

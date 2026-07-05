@@ -8,6 +8,7 @@ import type { ExtensionAPI } from "./pi.ts";
 import type { XmppConnectionStatus } from "./xmpp-api.ts";
 import type { XmppAccountConfig, XmppConfigStore } from "./config.ts";
 import type { XmppBridgeRuntime } from "./runtime.ts";
+import type { XmppRuntimeEventEntry } from "./status.ts";
 import { VERSION } from "./version.ts";
 
 export interface XmppExtensionCommandContext {
@@ -56,6 +57,7 @@ export interface XmppSlashCommandsDeps {
   getConnectedStatuses: () => Array<{ name: string; status: XmppConnectionStatus; jid?: string }>;
   getJoinedRooms: (name: string) => Array<{ room: string; occupants: number }>;
   getStatusDetail: (name: string) => { jid?: string; status: XmppConnectionStatus; rooms: Array<{ room: string; occupants: number }> };
+  getRuntimeEvents: () => XmppRuntimeEventEntry[];
   joinRoomOnAccount: (name: string, room: string, nick: string) => void;
   leaveRoomOnAccount: (name: string, room: string) => void;
   sendPresenceOnAccount: (name: string, options?: { show?: string; status?: string; type?: string; to?: string }) => void;
@@ -199,6 +201,7 @@ export function createXmppSlashCommands(deps: XmppSlashCommandsDeps) {
         const connected = deps.getConnectedStatuses();
         const accounts = deps.configStore.getAccounts();
         const ownerJid = deps.getOwnerJid();
+        const events = deps.getRuntimeEvents();
 
         const lines = [
           `**XMPP Bridge Status**`,
@@ -233,6 +236,18 @@ export function createXmppSlashCommands(deps: XmppSlashCommandsDeps) {
           lines.push(`**Default:** ${defaultAccount.name}`);
         }
         lines.push(`**Owner JID:** ${ownerJid ?? "anyone (no restriction)"}`);
+
+        // Show recent runtime events for debugging
+        const denied = events.filter((e) => e.category === "auth-deny" || e.category === "auth-pair");
+        if (denied.length > 0) {
+          lines.push(``);
+          lines.push(`**Recent auth events:**`);
+          for (const e of denied.slice(-5)) {
+            const time = new Date(e.timestamp).toLocaleTimeString();
+            const jid = e.details?.fromBare ?? "";
+            lines.push(`  [${time}] ${e.category}: ${jid}`);
+          }
+        }
 
         await deps.sendMessageToActiveTurn(lines.join("\n"));
       },
