@@ -36,6 +36,7 @@ export interface XmppInboundProgrammaticHandlerInput {
   isGroup: boolean;
   roomJid?: string;
   senderNick?: string;
+  ownerJid?: string;
   config: XmppConfig;
 }
 
@@ -85,6 +86,7 @@ export function getXmppInboundHandlers(): XmppInboundProgrammaticHandler[] {
 export async function processXmppInbound(
   route: XmppMessageRoute,
   config: XmppConfig,
+  ownerJid?: string,
 ): Promise<XmppInboundHandlerProcessResult> {
   const handlers = getXmppInboundHandlers();
 
@@ -98,6 +100,7 @@ export async function processXmppInbound(
         isGroup: route.isGroup,
         roomJid: route.roomJid,
         senderNick: route.senderNick,
+        ownerJid,
         config,
       });
 

@@ -13,7 +13,7 @@ export interface XmppStatusLineProviderContext {
   config: XmppConfig;
   connectionStatus: XmppConnectionStatus;
   connectedJid?: string;
-  allowedJid?: string;
+  ownerJid?: string;
   activeTurnFrom?: string;
   queuedCount: number;
 }
@@ -97,27 +97,34 @@ export function formatXmppStatusSummary(deps: {
   config: XmppConfig;
   connectionStatus: XmppConnectionStatus;
   connectedJid?: string;
-  allowedJid?: string;
+  ownerJid?: string;
   activeTurnFrom?: string;
   queuedCount: number;
   runtimeEvents: XmppRuntimeEventEntry[];
   recentErrors?: string[];
+  accountName?: string;
+  accountsCount?: number;
 }): string {
   const lines: string[] = [
     "## XMPP Bridge Status",
     "",
     `**Connection:** ${deps.connectionStatus}`,
+    `**Account:** ${deps.accountName ?? "(ad-hoc)"}`,
     `**JID:** ${deps.connectedJid ?? "not connected"}`,
     `**Configured JID:** ${deps.config.jid ?? "not configured"}`,
-    `**Allowed JID:** ${deps.allowedJid ?? "not paired"}`,
+    `**Owner JID:** ${deps.ownerJid ?? "anyone (no restriction)"}`,
     `**Active turn:** ${deps.activeTurnFrom ?? "none"}`,
     `**Queued messages:** ${deps.queuedCount}`,
     `**Service:** ${deps.config.service ?? "auto"}`,
     `**Domain:** ${deps.config.domain ?? "auto"}`,
   ];
 
-  if (deps.config.autoJoinRooms?.length) {
-    lines.push(`**Auto-join rooms:** ${deps.config.autoJoinRooms.join(", ")}`);
+  if (deps.accountsCount && deps.accountsCount > 1) {
+    lines.push(`**Configured accounts:** ${deps.accountsCount}`);
+  }
+
+  if (deps.config.autoJoinRoom) {
+    lines.push(`**Auto-join room:** ${deps.config.autoJoinRoom}`);
   }
 
   if (deps.recentErrors?.length) {

@@ -128,7 +128,7 @@ describe("status", () => {
       config: { jid: "user@domain.tld" },
       connectionStatus: "online",
       connectedJid: "user@domain.tld/full",
-      allowedJid: "user@domain.tld",
+      ownerJid: "user@domain.tld",
       activeTurnFrom: "user@domain.tld",
       queuedCount: 2,
       runtimeEvents: [],

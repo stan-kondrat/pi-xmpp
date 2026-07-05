@@ -5,8 +5,8 @@
  */
 
 import type { ExtensionAPI } from "./pi.ts";
-import type { XmppClientInstance, XmppConnectionStatus } from "./xmpp-api.ts";
-import type { XmppConfig, XmppConfigStore } from "./config.ts";
+import type { XmppConnectionStatus } from "./xmpp-api.ts";
+import type { XmppAccountConfig, XmppConfigStore } from "./config.ts";
 import type { XmppBridgeRuntime } from "./runtime.ts";
 
 export interface XmppExtensionCommandContext {
@@ -40,87 +40,182 @@ function getCommandRegistry(): XmppExtensionCommandRegistration[] {
   return globals[COMMAND_REGISTRY_KEY] as XmppExtensionCommandRegistration[];
 }
 
-export function createXmppSlashCommands(deps: {
-  client: XmppClientInstance;
+export interface XmppSlashCommandsDeps {
   configStore: XmppConfigStore;
   runtime: XmppBridgeRuntime;
-  getConnectionStatus: () => string;
   sendMessageToActiveTurn: (body: string) => Promise<void>;
   updateStatus: () => void;
-  getAllowedJid: () => string | undefined;
-}) {
+  getOwnerJid: () => string | undefined;
+  // Client manager
+  connectAccount: (name: string, config: XmppAccountConfig) => Promise<void>;
+  disconnectAccount: (name?: string) => Promise<void>;
+  getConnectedAccounts: () => string[];
+  getClientJid: (name: string) => string | undefined;
+  getClientStatus: (name: string) => XmppConnectionStatus;
+  getConnectedStatuses: () => Array<{ name: string; status: XmppConnectionStatus; jid?: string }>;
+  joinRoomOnAccount: (name: string, room: string, nick: string) => void;
+  leaveRoomOnAccount: (name: string, room: string) => void;
+  sendPresenceOnAccount: (name: string, options?: { show?: string; status?: string; type?: string; to?: string }) => void;
+}
+
+export function createXmppSlashCommands(deps: XmppSlashCommandsDeps) {
   return [
     {
       name: "xmpp-connect",
       description:
-        "Connect the XMPP client to your server. Provide --jid, --password, and --service options.",
+        "Connect an account. No args = default account. `name` = existing account. `name --jid --password [...]` = create new account. Keeps other connections alive.",
       handler: async (ctx: XmppExtensionCommandContext) => {
+        const rawTrimmed = ctx.rawArgs.trim();
         const args = parseArgs(ctx.rawArgs);
         const jid = args.jid ?? args.J;
         const password = args.password ?? args.p;
         const service = args.service ?? args.s;
         const domain = args.domain ?? args.d;
+        const accountFlag = args.account ?? args.a;
+        const ownerJid = args.ownerJid;
+        const autoJoinRoom = args.autoJoinRoom;
 
-        if (!jid || !password) {
-          await deps.sendMessageToActiveTurn(
-            "Usage: /xmpp-connect --jid user@domain.tld --password <your_password> [--service xmpp://server.tld] [--domain domain.tld]",
-          );
+        // First bareword that isn't a flag is treated as the account name
+        const bareword = extractFirstBareword(rawTrimmed);
+        const accountName = accountFlag ?? bareword;
+
+        // ── No args → connect default ──
+        if (!accountName && !jid && !password) {
+          const defaultAccount = deps.configStore.getDefaultAccount();
+          if (!defaultAccount || (!defaultAccount.jid && !defaultAccount.password)) {
+            await deps.sendMessageToActiveTurn(
+              "❌ No default account configured.\n" +
+              "Usage: /xmpp-connect                           (uses default from config)\n" +
+              "       /xmpp-connect account-name                (existing account from config)\n" +
+              "       /xmpp-connect account-name --jid ... --pw ...  (create new account)",
+            );
+            return;
+          }
+          const name = defaultAccount.name ?? "default";
+          const config = { ...defaultAccount };
+          try {
+            await deps.connectAccount(name, config);
+            deps.updateStatus();
+            await deps.sendMessageToActiveTurn(`✅ Connected as ${name} (${config.jid})`);
+          } catch (error) {
+            await deps.sendMessageToActiveTurn(
+              `❌ Connection failed: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
           return;
         }
 
-        const config = deps.configStore.get();
-        config.jid = jid;
-        config.password = password;
-        config.service = service || config.service;
-        config.domain = domain || config.domain;
-        deps.configStore.set(config);
-        await deps.configStore.persist();
+        // ── account-name + --jid --password → create a NEW account ──
+        if (accountName && jid && password) {
+          const config: XmppAccountConfig = {
+            name: accountName,
+            jid,
+            password,
+            service: service || undefined,
+            domain: domain || undefined,
+            ownerJid: ownerJid || undefined,
+            autoJoinRoom: autoJoinRoom || undefined,
+          };
+          deps.configStore.setActiveAccount(accountName);
+          deps.configStore.set(config);
+          await deps.configStore.persist();
 
-        try {
-          await deps.client.connect(config);
-          deps.updateStatus();
-          await deps.sendMessageToActiveTurn(
-            `✅ Connected as ${jid}`,
-          );
-        } catch (error) {
-          await deps.sendMessageToActiveTurn(
-            `❌ Connection failed: ${error instanceof Error ? error.message : String(error)}`,
-          );
+          try {
+            await deps.connectAccount(accountName, config);
+            deps.updateStatus();
+            await deps.sendMessageToActiveTurn(
+              `✅ Connected as ${accountName} (${jid})${ownerJid ? ` — owner: ${ownerJid}` : ""}`,
+            );
+          } catch (error) {
+            await deps.sendMessageToActiveTurn(
+              `❌ Connection failed: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+          return;
         }
+
+        // ── account-name only → connect existing account ──
+        if (accountName && !jid) {
+          const account = deps.configStore.getAccountByName(accountName);
+          if (!account) {
+            await deps.sendMessageToActiveTurn(
+              `❌ Account "${accountName}" not found. Available: ${
+                deps.configStore.getAccounts().map((a) => a.name).filter(Boolean).join(", ") || "(none)"
+              }`,
+            );
+            return;
+          }
+          const config = { ...account };
+          if (password) config.password = password;
+          try {
+            await deps.connectAccount(accountName, config);
+            deps.updateStatus();
+            await deps.sendMessageToActiveTurn(`✅ Connected as ${accountName}`);
+          } catch (error) {
+            await deps.sendMessageToActiveTurn(
+              `❌ Connection failed: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+          return;
+        }
+
+        // ── fallback: show usage ──
+        await deps.sendMessageToActiveTurn(
+          "Usage: /xmpp-connect                           (uses default from config)\n" +
+          "       /xmpp-connect account-name                (existing account from config)\n" +
+          "       /xmpp-connect account-name --jid ... --pw ...  (create new account)",
+        );
       },
     },
     {
       name: "xmpp-disconnect",
-      description: "Disconnect the XMPP client.",
-      handler: async () => {
-        await deps.client.disconnect();
-        deps.updateStatus();
-        await deps.sendMessageToActiveTurn("🔌 Disconnected from XMPP server.");
+      description:
+        "Disconnect. Without args, disconnects ALL accounts. With an account name, disconnects only that account.",
+      handler: async (ctx: XmppExtensionCommandContext) => {
+        const rawTrimmed = ctx.rawArgs.trim();
+        const args = parseArgs(rawTrimmed);
+        const accountName = args.account ?? args.a ?? extractFirstBareword(rawTrimmed);
+
+        if (accountName) {
+          await deps.disconnectAccount(accountName);
+          deps.updateStatus();
+          await deps.sendMessageToActiveTurn(`🔌 Disconnected ${accountName}.`);
+        } else {
+          await deps.disconnectAccount();
+          deps.updateStatus();
+          await deps.sendMessageToActiveTurn("🔌 Disconnected all accounts.");
+        }
       },
     },
     {
       name: "xmpp-status",
-      description: "Show XMPP connection status and configuration info.",
+      description: "Show XMPP connection status and diagnostics for all accounts.",
       handler: async () => {
-        const config = deps.configStore.get();
-        const status = deps.client.status;
-        const jid = deps.client.jid;
-        const allowedJid = deps.getAllowedJid();
+        const connected = deps.getConnectedStatuses();
+        const accounts = deps.configStore.getAccounts();
+        const ownerJid = deps.getOwnerJid();
 
         const lines = [
           `**XMPP Bridge Status**`,
           ``,
-          `**Connection:** ${status}`,
-          `**JID:** ${jid ?? "not connected"}`,
-          `**Configured JID:** ${config.jid ?? "not configured"}`,
-          `**Service:** ${config.service ?? "auto"}`,
-          `**Allowed JID:** ${allowedJid ?? "not paired"}`,
-          `**Auto-reconnect:** ${config.autoReconnect ?? true}`,
         ];
 
-        if (config.autoJoinRooms?.length) {
-          lines.push(`**Auto-join rooms:** ${config.autoJoinRooms.join(", ")}`);
+        if (connected.length === 0) {
+          lines.push(`**No active connections.**`);
         }
+
+        for (const c of connected) {
+          const icon = c.status === "online" ? "🟢" : c.status === "connecting" ? "🟡" : "🔴";
+          lines.push(`${icon} **${c.name}** — ${c.status}${c.jid ? ` (${c.jid})` : ""}`);
+        }
+
+        lines.push(``);
+        lines.push(`**Configured accounts:** ${accounts.length}`);
+        const defaultAccount = deps.configStore.getDefaultAccount();
+        if (defaultAccount?.name) {
+          lines.push(`**Default:** ${defaultAccount.name}`);
+        }
+        lines.push(`**Owner JID:** ${ownerJid ?? "anyone (no restriction)"}`);
 
         await deps.sendMessageToActiveTurn(lines.join("\n"));
       },
@@ -128,85 +223,111 @@ export function createXmppSlashCommands(deps: {
     {
       name: "xmpp-join",
       description:
-        "Join a MUC room. Usage: /xmpp-join --room room@conference.tld --nick your_nick",
+        "Join a MUC room on a connected account. Usage: /xmpp-join --room room@conference.tld [--nick your_nick] [--account account-name]",
       handler: async (ctx: XmppExtensionCommandContext) => {
         const args = parseArgs(ctx.rawArgs);
         const room = args.room ?? args.r;
         const nick = args.nick ?? args.n;
+        const accountName = args.account ?? args.a ?? deps.getConnectedAccounts()[0];
 
-        if (!room) {
+        if (!room || !accountName) {
           await deps.sendMessageToActiveTurn(
-            "Usage: /xmpp-join --room room@conference.tld [--nick your_nick]",
+            "Usage: /xmpp-join --room room@conference.tld [--nick your_nick] [--account account-name]",
           );
           return;
         }
 
-        const nickname = nick ?? deps.client.jid?.split("@")[0] ?? "pi";
-        deps.client.joinRoom(room, nickname);
+        const jid = deps.getClientJid(accountName);
+        const nickname = nick ?? jid?.split("@")[0] ?? "pi";
+        deps.joinRoomOnAccount(accountName, room, nickname);
 
-        const config = deps.configStore.get();
-        const rooms = config.autoJoinRooms ?? [];
-        if (!rooms.includes(room)) {
-          rooms.push(room);
-          config.autoJoinRooms = rooms;
-          deps.configStore.set(config);
+        // Save to the account's config
+        const account = deps.configStore.getAccountByName(accountName);
+        if (account && !account.autoJoinRoom) {
+          account.autoJoinRoom = room;
+          deps.configStore.setActiveAccount(accountName);
+          deps.configStore.set(account);
           await deps.configStore.persist();
         }
 
         await deps.sendMessageToActiveTurn(
-          `🚪 Joined room ${room} as ${nickname}`,
+          `🚪 Joined room ${room} as ${nickname} on ${accountName}`,
         );
       },
     },
     {
       name: "xmpp-leave",
       description:
-        "Leave a MUC room. Usage: /xmpp-leave --room room@conference.tld",
+        "Leave a MUC room on a connected account. Usage: /xmpp-leave --room room@conference.tld [--account account-name]",
       handler: async (ctx: XmppExtensionCommandContext) => {
         const args = parseArgs(ctx.rawArgs);
         const room = args.room ?? args.r;
+        const accountName = args.account ?? args.a ?? deps.getConnectedAccounts()[0];
 
-        if (!room) {
+        if (!room || !accountName) {
           await deps.sendMessageToActiveTurn(
-            "Usage: /xmpp-leave --room room@conference.tld",
+            "Usage: /xmpp-leave --room room@conference.tld [--account account-name]",
           );
           return;
         }
 
-        deps.client.leaveRoom(room);
+        deps.leaveRoomOnAccount(accountName, room);
 
-        const config = deps.configStore.get();
-        if (config.autoJoinRooms) {
-          config.autoJoinRooms = config.autoJoinRooms.filter(
-            (r) => r !== room,
-          );
-          deps.configStore.set(config);
+        // Clear from config if it's the auto-join room
+        const account = deps.configStore.getAccountByName(accountName);
+        if (account && account.autoJoinRoom === room) {
+          delete account.autoJoinRoom;
+          deps.configStore.setActiveAccount(accountName);
+          deps.configStore.set(account);
           await deps.configStore.persist();
         }
 
-        await deps.sendMessageToActiveTurn(`🚪 Left room ${room}`);
+        await deps.sendMessageToActiveTurn(`🚪 Left room ${room} on ${accountName}`);
       },
     },
     {
       name: "xmpp-set-presence",
       description:
-        "Set your presence. Usage: /xmpp-set-presence [--show chat|away|dnd|xa] [--status message]",
+        "Set presence on all connected accounts. Usage: /xmpp-set-presence [--show chat|away|dnd|xa] [--status message]",
       handler: async (ctx: XmppExtensionCommandContext) => {
         const args = parseArgs(ctx.rawArgs);
         const show = args.show ?? args.s;
         const status = args.status ?? args.m;
+        const connected = deps.getConnectedAccounts();
 
-        deps.client.sendPresence({
-          show: show || undefined,
-          status: status || undefined,
-        });
+        if (connected.length === 0) {
+          await deps.sendMessageToActiveTurn("❌ No accounts connected.");
+          return;
+        }
+
+        for (const name of connected) {
+          deps.sendPresenceOnAccount(name, {
+            show: show || undefined,
+            status: status || undefined,
+          });
+        }
 
         await deps.sendMessageToActiveTurn(
-          `🟢 Presence updated: ${show ?? "available"}${status ? ` (${status})` : ""}`,
+          `🟢 Presence updated on ${connected.length} account(s): ${show ?? "available"}${status ? ` (${status})` : ""}`,
         );
       },
     },
   ];
+}
+
+function extractFirstBareword(raw: string): string | undefined {
+  const tokens = raw.match(/(?:--?\w+(?:=\S+)?|"[^"]*"|'[^']*'|\S+)/g) ?? [];
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (t.startsWith("--")) {
+      if (!t.includes("=")) i++;
+    } else if (t.startsWith("-") && t.length === 2) {
+      if (i + 1 < tokens.length && !tokens[i + 1].startsWith("-")) i++;
+    } else {
+      return t.replace(/^["']|["']$/g, "");
+    }
+  }
+  return undefined;
 }
 
 function parseArgs(raw: string): Record<string, string> {

@@ -9,7 +9,6 @@ import * as Commands from "./lib/commands.ts";
 import * as Config from "./lib/config.ts";
 import * as Inbound from "./lib/inbound.ts";
 import * as Lifecycle from "./lib/lifecycle.ts";
-import * as Model from "./lib/model.ts";
 import * as Outbound from "./lib/outbound.ts";
 import * as Prompts from "./lib/prompts.ts";
 import * as Queue from "./lib/queue.ts";
@@ -17,17 +16,134 @@ import * as Routing from "./lib/routing.ts";
 import * as Runtime from "./lib/runtime.ts";
 import * as Status from "./lib/status.ts";
 import * as XmppApi from "./lib/xmpp-api.ts";
+import type { XmppConnectionStatus } from "./lib/xmpp-api.ts";
 import { Type } from "@sinclair/typebox";
 import * as Updates from "./api/updates.ts";
 
-// --- Extension Runtime ---
+// ── Client Manager ──
+
+interface ManagedClient {
+  client: XmppApi.XmppClientInstance;
+  accountName: string;
+}
+
+function createXmppClientManager(
+  onStanza: (accountName: string, stanza: XmppApi.XmppStanza) => void,
+  recordRuntimeEvent: (category: string, error: unknown, details?: Record<string, unknown>) => void,
+) {
+  const clients = new Map<string, ManagedClient>();
+
+  async function connectAccount(name: string, config: Config.XmppAccountConfig): Promise<void> {
+    // Disconnect existing client for this name if any
+    const existing = clients.get(name);
+    if (existing) {
+      await existing.client.disconnect();
+    }
+
+    const client = XmppApi.createXmppClient();
+
+    // Wire stanza handler scoped to this account
+    client.onStanza((stanza) => onStanza(name, stanza));
+
+    // Wire error logging
+    client.onError((error) => {
+      recordRuntimeEvent("xmpp-error", error, { account: name });
+    });
+
+    clients.set(name, { client, accountName: name });
+
+    // Build connect config
+    const connectConfig: Config.XmppAccountConfig = {
+      jid: config.jid,
+      password: config.password,
+      service: config.service,
+      domain: config.domain,
+      resource: config.resource,
+      autoReconnect: config.autoReconnect,
+    };
+
+    await client.connect(connectConfig);
+
+    // Auto-join room
+    if (config.autoJoinRoom) {
+      const nick = config.jid?.split("@")[0] ?? "pi";
+      client.joinRoom(config.autoJoinRoom, nick);
+    }
+  }
+
+  async function disconnectAccount(name?: string): Promise<void> {
+    if (name) {
+      const entry = clients.get(name);
+      if (entry) {
+        await entry.client.disconnect();
+        clients.delete(name);
+      }
+    } else {
+      for (const [, entry] of clients) {
+        await entry.client.disconnect();
+      }
+      clients.clear();
+    }
+  }
+
+  function getConnectedAccounts(): string[] {
+    return Array.from(clients.keys());
+  }
+
+  function getClientJid(name: string): string | undefined {
+    return clients.get(name)?.client.jid;
+  }
+
+  function getClientStatus(name: string): XmppConnectionStatus {
+    return clients.get(name)?.client.status ?? "offline";
+  }
+
+  function getConnectedStatuses(): Array<{ name: string; status: XmppConnectionStatus; jid?: string }> {
+    const result: Array<{ name: string; status: XmppConnectionStatus; jid?: string }> = [];
+    for (const [name, entry] of clients) {
+      result.push({ name, status: entry.client.status, jid: entry.client.jid });
+    }
+    return result;
+  }
+
+  function joinRoomOnAccount(name: string, room: string, nick: string): void {
+    clients.get(name)?.client.joinRoom(room, nick);
+  }
+
+  function leaveRoomOnAccount(name: string, room: string): void {
+    clients.get(name)?.client.leaveRoom(room);
+  }
+
+  function sendPresenceOnAccount(name: string, options?: { show?: string; status?: string; type?: string; to?: string }): void {
+    clients.get(name)?.client.sendPresence(options);
+  }
+
+  function getClientForTurn(accountName?: string): XmppApi.XmppClientInstance | undefined {
+    if (accountName) return clients.get(accountName)?.client;
+    // Fall back to first connected
+    const first = clients.values().next().value;
+    return first?.client;
+  }
+
+  return {
+    connectAccount,
+    disconnectAccount,
+    getConnectedAccounts,
+    getClientJid,
+    getClientStatus,
+    getConnectedStatuses,
+    joinRoomOnAccount,
+    leaveRoomOnAccount,
+    sendPresenceOnAccount,
+    getClientForTurn,
+  };
+}
+
+// ── Extension Runtime ──
 
 export default function (pi: Pi.ExtensionAPI) {
   const piRuntime = Pi.createExtensionApiRuntimePorts(pi);
   const { sendUserMessage } = piRuntime;
-
-  // --- XMPP Client ---
-  const xmppClient = XmppApi.createXmppClient();
 
   // --- Instance identity ---
   const xmppInstanceId = `${process.pid}:${Date.now()}`;
@@ -59,16 +175,22 @@ export default function (pi: Pi.ExtensionAPI) {
   const xmppQueueStore = Queue.createXmppQueueStore<Pi.ExtensionContext>();
 
   // --- Status helpers ---
-  const getAllowedJid = () => configStore.getAllowedJid();
-  const getConnectionStatus = () => xmppClient.status;
-  const getActiveTurnFrom = () => activeTurnRuntime.get()?.fromBare;
+  const getOwnerJid = () => configStore.getOwnerJid();
 
   const sendMessageToActiveTurn = async function (body: string): Promise<void> {
     sendUserMessage(body);
   };
 
+  // --- Create client manager ---
+  const clientManager = createXmppClientManager(
+    (accountName, stanza) => {
+      handleIncomingStanza(accountName, stanza);
+    },
+    recordRuntimeEvent,
+  );
+
   // --- Incoming stanza handler ---
-  const handleIncomingStanza = async function (stanza: XmppApi.XmppStanza): Promise<void> {
+  const handleIncomingStanza = async function (accountName: string, stanza: XmppApi.XmppStanza): Promise<void> {
     // Run through update handlers first
     const updateHandlers = Updates.getXmppUpdateHandlers();
     for (const handler of updateHandlers) {
@@ -85,35 +207,49 @@ export default function (pi: Pi.ExtensionAPI) {
     if (!route) return;
 
     if (route.kind === "message") {
-      await handleIncomingMessage(route);
+      await handleIncomingMessage(accountName, route);
     } else if (route.kind === "presence") {
       await handleIncomingPresence(route);
     }
   };
 
   // --- Incoming message handler ---
-  const handleIncomingMessage = async function (route: Routing.XmppMessageRoute): Promise<void> {
+  const handleIncomingMessage = async function (accountName: string, route: Routing.XmppMessageRoute): Promise<void> {
     // Skip error messages
     if (route.type === "error") return;
 
-    // Check authorization
-    const auth = Config.getXmppAuthorizationState(
-      route.fromBare,
-      configStore.getAllowedJid(),
-    );
+    // Get the account's config for auth
+    const accountConfig = configStore.getAccountByName(accountName);
+    const ownerJid = accountConfig?.ownerJid;
 
-    if (auth.kind === "deny") return;
+    if (route.isGroup) {
+      // In groupchats: if no owner is configured, anyone can participate.
+      // If an owner is configured, only their messages are processed.
+      if (ownerJid && route.fromBare !== ownerJid) return;
+    } else {
+      // Direct messages: use pairing/allow/deny
+      const auth = Config.getXmppAuthorizationState(
+        route.fromBare,
+        ownerJid,
+      );
 
-    // Auto-pair if needed
-    if (auth.kind === "pair") {
-      configStore.setAllowedJid(route.fromBare);
-      await configStore.persist();
-      recordRuntimeEvent("pair", null, { jid: route.fromBare });
+      if (auth.kind === "deny") return;
+
+      // Auto-pair if needed (first DM sender becomes owner)
+      if (auth.kind === "pair") {
+        if (accountConfig) {
+          accountConfig.ownerJid = route.fromBare;
+          configStore.setActiveAccount(accountName);
+          configStore.set(accountConfig);
+          await configStore.persist();
+        }
+        recordRuntimeEvent("pair", null, { account: accountName, jid: route.fromBare });
+      }
     }
 
     // Process through inbound handler pipeline
-    const config = configStore.get();
-    const inboundResult = await Inbound.processXmppInbound(route, config);
+    const config = accountConfig ?? {};
+    const inboundResult = await Inbound.processXmppInbound(route, config, ownerJid);
 
     // Build turn context
     const turn: Queue.XmppTurnContext = {
@@ -126,6 +262,7 @@ export default function (pi: Pi.ExtensionAPI) {
       isGroup: route.isGroup,
       roomJid: route.roomJid,
       senderNick: route.senderNick,
+      accountName,
       timestamp: Date.now(),
     };
 
@@ -187,8 +324,6 @@ export default function (pi: Pi.ExtensionAPI) {
       bridgeRuntime.state.xmppTurnDispatchPending = false;
     });
 
-    // Send the prompt to Pi
-    // Note: activeTurnRuntime is cleared in onAgentEnd after the agent finishes processing
     try {
       sendUserMessage(next.prompt);
     } catch (error: unknown) {
@@ -201,16 +336,20 @@ export default function (pi: Pi.ExtensionAPI) {
 
   // --- Register slash commands ---
   const allCommands = Commands.createXmppSlashCommands({
-    client: xmppClient,
     configStore,
     runtime: bridgeRuntime,
-    getConnectionStatus,
     sendMessageToActiveTurn,
-    updateStatus: () => {
-      // Status is pushed declaratively via getConnectionStatus/getAllowedJid;
-      // individual commands that change state can call this to trigger a status refresh.
-    },
-    getAllowedJid,
+    updateStatus: () => {},
+    getOwnerJid,
+    connectAccount: clientManager.connectAccount,
+    disconnectAccount: clientManager.disconnectAccount,
+    getConnectedAccounts: clientManager.getConnectedAccounts,
+    getClientJid: clientManager.getClientJid,
+    getClientStatus: clientManager.getClientStatus,
+    getConnectedStatuses: clientManager.getConnectedStatuses,
+    joinRoomOnAccount: clientManager.joinRoomOnAccount,
+    leaveRoomOnAccount: clientManager.leaveRoomOnAccount,
+    sendPresenceOnAccount: clientManager.sendPresenceOnAccount,
   });
 
   for (const cmd of allCommands) {
@@ -222,12 +361,12 @@ export default function (pi: Pi.ExtensionAPI) {
     });
   }
 
-    // --- Register the xmpp_send tool ---
+  // --- Register the xmpp_send tool ---
   pi.registerTool({
     name: "xmpp_send",
     label: "Send XMPP Message",
     description:
-      "Send a message via XMPP. Provide `to` (JID), `body` (message text), and optionally `type` (chat or groupchat).",
+      "Send a message via XMPP. Provide `to` (JID), `body` (message text), and optionally `type` (chat or groupchat). Replies go through the account that received the current turn.",
     parameters: Type.Object({
       to: Type.String({ description: "Recipient JID" }),
       body: Type.String({ description: "Message body" }),
@@ -235,8 +374,22 @@ export default function (pi: Pi.ExtensionAPI) {
       subject: Type.Optional(Type.String({ description: "Optional message subject" })),
     }),
     execute: async (_toolCallId: string, params: { to: string; body: string; type?: string; subject?: string }) => {
+      const turn = activeTurnRuntime.get();
+      // Use the client for the account that received the current turn, or fall back to first connected
+      const client = turn?.accountName
+        ? clientManager.getClientForTurn(turn.accountName)
+        : clientManager.getClientForTurn();
+
+      if (!client) {
+        return {
+          content: [{ type: "text" as const, text: "No XMPP account connected. Use /xmpp-connect first." }],
+          isError: true,
+          details: {},
+        };
+      }
+
       try {
-        await Outbound.sendXmppMessage(xmppClient, params.to, params.body, {
+        await Outbound.sendXmppMessage(client, params.to, params.body, {
           type: params.type,
           subject: params.subject,
         });
@@ -269,26 +422,20 @@ export default function (pi: Pi.ExtensionAPI) {
     onSessionStart: async (_event, ctx) => {
       sessionContextStore.set(ctx);
 
-      // Try to auto-connect if credentials are stored
-      const config = configStore.get();
-      if (config.jid && config.password && xmppClient.status === "offline") {
+      // Auto-connect the default account
+      const defaultAccount = configStore.getDefaultAccount();
+      if (defaultAccount?.jid && defaultAccount?.password) {
+        const name = defaultAccount.name ?? "default";
         try {
-          await xmppClient.connect(config);
-
-          // Auto-join configured rooms
-          if (config.autoJoinRooms?.length) {
-            const nick = config.jid.split("@")[0];
-            for (const room of config.autoJoinRooms) {
-              xmppClient.joinRoom(room, nick);
-            }
-          }
+          await clientManager.connectAccount(name, defaultAccount);
         } catch (error) {
-          recordRuntimeEvent("auto-connect", error);
+          recordRuntimeEvent("auto-connect", error, { account: name });
         }
       }
     },
 
     onSessionShutdown: async () => {
+      await clientManager.disconnectAccount();
       sessionContextStore.clear();
     },
 
@@ -301,7 +448,6 @@ export default function (pi: Pi.ExtensionAPI) {
     },
 
     onAgentEnd: async () => {
-      // Agent finished processing; clear active turn and dispatch next queued
       activeTurnRuntime.clear();
       bridgeRuntime.state.xmppTurnDispatchPending = false;
       abort.clearHandler();
@@ -309,17 +455,9 @@ export default function (pi: Pi.ExtensionAPI) {
     },
   });
 
-  // --- Stanza listener ---
-  xmppClient.onStanza(handleIncomingStanza);
-
   // --- Record extension start ---
   recordRuntimeEvent("extension-start", null, {
     instanceId: xmppInstanceId,
     pid: process.pid,
-  });
-
-  // --- Handle uncaught XMPP errors ---
-  xmppClient.onError((error) => {
-    recordRuntimeEvent("xmpp-error", error);
   });
 }

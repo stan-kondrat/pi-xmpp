@@ -17,6 +17,8 @@ export interface XmppTurnContext {
   isGroup: boolean;
   roomJid?: string;
   senderNick?: string;
+  /** Account name that received this message */
+  accountName?: string;
   timestamp: number;
 }
 
