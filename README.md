@@ -143,7 +143,6 @@ Accounts are keyed objects — the special `"default"` key auto-connects on star
 | `password` | yes | — | Your XMPP password |
 | `service` | no | `xmpp://<jid-domain>` | Server address (use for non-standard ports or WebSocket/BOSH endpoints) |
 | `domain` | no | JID domain | XMPP domain |
-| `resource` | no | `pi-bridge` | Client resource identifier |
 | `ownerJid` | no | — | Authorized JID (see Authorization below) |
 | `autoReconnect` | no | `true` | Reconnect on disconnect |
 | `autoJoinRoom` | no | — | Single MUC room JID to join on connect |

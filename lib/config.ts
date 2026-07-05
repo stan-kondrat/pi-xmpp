@@ -39,7 +39,6 @@ export interface XmppAccountConfig {
   password?: string;
   service?: string;
   domain?: string;
-  resource?: string;
   /** JID authorized to send commands (only this JID's messages are processed).
    *  When unset in a groupchat, all participants may send messages.
    *  When unset in DMs, the first sender is auto-paired. */
@@ -164,7 +163,6 @@ function normalizeAccountsFile(raw: Record<string, unknown>): {
     if (typeof f.password === "string") account.password = f.password;
     if (typeof f.service === "string") account.service = f.service;
     if (typeof f.domain === "string") account.domain = f.domain;
-    if (typeof f.resource === "string") account.resource = f.resource;
     if (typeof f.ownerJid === "string") account.ownerJid = f.ownerJid;
 
     if (typeof f.autoReconnect === "boolean") account.autoReconnect = f.autoReconnect;
@@ -189,7 +187,6 @@ function normalizeAccountsFile(raw: Record<string, unknown>): {
     if (typeof obj.password === "string") account.password = obj.password;
     if (typeof obj.service === "string") account.service = obj.service;
     if (typeof obj.domain === "string") account.domain = obj.domain;
-    if (typeof obj.resource === "string") account.resource = obj.resource;
     if (typeof obj.ownerJid === "string") account.ownerJid = obj.ownerJid;
 
     if (typeof obj.autoReconnect === "boolean") account.autoReconnect = obj.autoReconnect;

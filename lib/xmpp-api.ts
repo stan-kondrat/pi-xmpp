@@ -116,7 +116,6 @@ export function createXmppClient(): XmppClientInstance {
         domain,
         username: parsedJid.local,
         password: config.password,
-        resource: config.resource ?? "pi-bridge",
       });
 
       xmpp.on("status", (status: string) => {

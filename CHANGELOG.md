@@ -11,7 +11,8 @@
 - **`autoJoinRoom` field** — Changed from array `autoJoinRooms` to a single room JID string.
 - **Groupchat authorization** — When `ownerJid` is unset, all room participants can send commands. When set, only the owner's messages are processed.
 - **DM auto-pairing** — First DM sender becomes owner when no `ownerJid` is configured.
-- **`/xmpp-status`** — Now shows all active connections with status icons (🟢🟡🔴), account names, and JIDs.
+- **`/xmpp-status`** — Now shows all active connections with status icons (🟢🟡🔴), account names, JIDs, and joined MUC rooms with real-time occupant counts.
+- **Room occupant tracking** — The bridge tracks MUC room occupants via presence stanzas and displays counts in `/xmpp-status`.
 - **`/xmpp-join` / `/xmpp-leave`** — Accept `--account` flag to target a specific connection.
 - **`/xmpp-set-presence`** — Updates presence on all connected accounts.
 - **`xmpp_send` tool** — Replies through the account that received the current turn.

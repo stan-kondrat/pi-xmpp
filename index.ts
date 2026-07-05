@@ -32,6 +32,8 @@ function createXmppClientManager(
   recordRuntimeEvent: (category: string, error: unknown, details?: Record<string, unknown>) => void,
 ) {
   const clients = new Map<string, ManagedClient>();
+  // Track joined rooms per account: account → Map<roomJid, Set<occupantBareJid>>
+  const joinedRooms = new Map<string, Map<string, Set<string>>>();
 
   async function connectAccount(name: string, config: Config.XmppAccountConfig): Promise<void> {
     // Disconnect existing client for this name if any
@@ -42,8 +44,27 @@ function createXmppClientManager(
 
     const client = XmppApi.createXmppClient();
 
-    // Wire stanza handler scoped to this account
-    client.onStanza((stanza) => onStanza(name, stanza));
+    // Track joined rooms for this account
+    if (!joinedRooms.has(name)) {
+      joinedRooms.set(name, new Map());
+    }
+    const rooms = joinedRooms.get(name)!;
+
+    // Wire stanza handler scoped to this account — also tracks room occupants
+    client.onStanza((stanza) => {
+      // Track MUC presence for occupant counting
+      if (stanza.name === "presence" && stanza.attrs.from) {
+        const fromBare = Routing.getBareJid(stanza.attrs.from);
+        if (rooms.has(fromBare)) {
+          if (stanza.attrs.type === "unavailable") {
+            rooms.get(fromBare)!.delete(stanza.attrs.from);
+          } else {
+            rooms.get(fromBare)!.add(stanza.attrs.from);
+          }
+        }
+      }
+      onStanza(name, stanza);
+    });
 
     // Wire error logging
     client.onError((error) => {
@@ -58,7 +79,6 @@ function createXmppClientManager(
       password: config.password,
       service: config.service,
       domain: config.domain,
-      resource: config.resource,
       autoReconnect: config.autoReconnect,
     };
 
@@ -78,11 +98,13 @@ function createXmppClientManager(
         await entry.client.disconnect();
         clients.delete(name);
       }
+      joinedRooms.delete(name);
     } else {
       for (const [, entry] of clients) {
         await entry.client.disconnect();
       }
       clients.clear();
+      joinedRooms.clear();
     }
   }
 
@@ -108,10 +130,19 @@ function createXmppClientManager(
 
   function joinRoomOnAccount(name: string, room: string, nick: string): void {
     clients.get(name)?.client.joinRoom(room, nick);
+    // Initialize occupant tracking for this room
+    if (!joinedRooms.has(name)) {
+      joinedRooms.set(name, new Map());
+    }
+    if (!joinedRooms.get(name)!.has(room)) {
+      joinedRooms.get(name)!.set(room, new Set());
+    }
   }
 
   function leaveRoomOnAccount(name: string, room: string): void {
     clients.get(name)?.client.leaveRoom(room);
+    // Clean up occupant tracking
+    joinedRooms.get(name)?.delete(room);
   }
 
   function sendPresenceOnAccount(name: string, options?: { show?: string; status?: string; type?: string; to?: string }): void {
@@ -125,6 +156,25 @@ function createXmppClientManager(
     return first?.client;
   }
 
+  function getJoinedRooms(name: string): Array<{ room: string; occupants: number }> {
+    const rooms = joinedRooms.get(name);
+    if (!rooms) return [];
+    const result: Array<{ room: string; occupants: number }> = [];
+    for (const [room, occupants] of rooms) {
+      result.push({ room, occupants: occupants.size });
+    }
+    return result;
+  }
+
+  function getStatusDetail(name: string): { jid?: string; status: XmppConnectionStatus; rooms: Array<{ room: string; occupants: number }> } {
+    const entry = clients.get(name);
+    return {
+      jid: entry?.client.jid,
+      status: entry?.client.status ?? "offline",
+      rooms: getJoinedRooms(name),
+    };
+  }
+
   return {
     connectAccount,
     disconnectAccount,
@@ -136,6 +186,8 @@ function createXmppClientManager(
     leaveRoomOnAccount,
     sendPresenceOnAccount,
     getClientForTurn,
+    getJoinedRooms,
+    getStatusDetail,
   };
 }
 
@@ -347,6 +399,8 @@ export default function (pi: Pi.ExtensionAPI) {
     getClientJid: clientManager.getClientJid,
     getClientStatus: clientManager.getClientStatus,
     getConnectedStatuses: clientManager.getConnectedStatuses,
+    getJoinedRooms: clientManager.getJoinedRooms,
+    getStatusDetail: clientManager.getStatusDetail,
     joinRoomOnAccount: clientManager.joinRoomOnAccount,
     leaveRoomOnAccount: clientManager.leaveRoomOnAccount,
     sendPresenceOnAccount: clientManager.sendPresenceOnAccount,
@@ -421,6 +475,9 @@ export default function (pi: Pi.ExtensionAPI) {
   Lifecycle.registerXmppLifecycleHooks(pi, {
     onSessionStart: async (_event, ctx) => {
       sessionContextStore.set(ctx);
+
+      // Load config from disk before accessing accounts
+      await configStore.load();
 
       // Auto-connect the default account
       const defaultAccount = configStore.getDefaultAccount();

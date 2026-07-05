@@ -53,6 +53,8 @@ export interface XmppSlashCommandsDeps {
   getClientJid: (name: string) => string | undefined;
   getClientStatus: (name: string) => XmppConnectionStatus;
   getConnectedStatuses: () => Array<{ name: string; status: XmppConnectionStatus; jid?: string }>;
+  getJoinedRooms: (name: string) => Array<{ room: string; occupants: number }>;
+  getStatusDetail: (name: string) => { jid?: string; status: XmppConnectionStatus; rooms: Array<{ room: string; occupants: number }> };
   joinRoomOnAccount: (name: string, room: string, nick: string) => void;
   leaveRoomOnAccount: (name: string, room: string) => void;
   sendPresenceOnAccount: (name: string, options?: { show?: string; status?: string; type?: string; to?: string }) => void;
@@ -81,6 +83,8 @@ export function createXmppSlashCommands(deps: XmppSlashCommandsDeps) {
 
         // ── No args → connect default ──
         if (!accountName && !jid && !password) {
+          // Ensure config is loaded from disk
+          await deps.configStore.load();
           const defaultAccount = deps.configStore.getDefaultAccount();
           if (!defaultAccount || (!defaultAccount.jid && !defaultAccount.password)) {
             await deps.sendMessageToActiveTurn(
@@ -206,7 +210,18 @@ export function createXmppSlashCommands(deps: XmppSlashCommandsDeps) {
 
         for (const c of connected) {
           const icon = c.status === "online" ? "🟢" : c.status === "connecting" ? "🟡" : "🔴";
-          lines.push(`${icon} **${c.name}** — ${c.status}${c.jid ? ` (${c.jid})` : ""}`);
+          let line = `${icon} **${c.name}** — ${c.status}${c.jid ? ` (${c.jid})` : ""}`;
+
+          // Show joined rooms with occupant counts
+          const detail = deps.getStatusDetail(c.name);
+          if (detail.rooms.length > 0) {
+            const roomInfo = detail.rooms
+              .map((r) => `${r.room} (${r.occupants} occupant${r.occupants === 1 ? "" : "s"})`)
+              .join(", ");
+            line += `\n   🚪 ${roomInfo}`;
+          }
+
+          lines.push(line);
         }
 
         lines.push(``);
