@@ -8,6 +8,7 @@ import type { ExtensionAPI } from "./pi.ts";
 import type { XmppConnectionStatus } from "./xmpp-api.ts";
 import type { XmppAccountConfig, XmppConfigStore } from "./config.ts";
 import type { XmppBridgeRuntime } from "./runtime.ts";
+import { VERSION } from "./version.ts";
 
 export interface XmppExtensionCommandContext {
   args: string[];
@@ -201,6 +202,7 @@ export function createXmppSlashCommands(deps: XmppSlashCommandsDeps) {
 
         const lines = [
           `**XMPP Bridge Status**`,
+          `**Version:** ${VERSION}`,
           ``,
         ];
 

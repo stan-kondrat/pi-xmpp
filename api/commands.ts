@@ -9,3 +9,6 @@ export {
   type XmppExtensionCommandContext,
   type XmppExtensionCommandRegistration,
 } from "../lib/commands.ts";
+
+/** pi-xmpp version */
+export { VERSION } from "../lib/version.ts";

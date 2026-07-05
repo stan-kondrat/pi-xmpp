@@ -84,10 +84,10 @@ function createXmppClientManager(
 
     await client.connect(connectConfig);
 
-    // Auto-join room
+    // Auto-join room — use joinRoomOnAccount to initialize occupant tracking
     if (config.autoJoinRoom) {
       const nick = config.jid?.split("@")[0] ?? "pi";
-      client.joinRoom(config.autoJoinRoom, nick);
+      joinRoomOnAccount(name, config.autoJoinRoom, nick);
     }
   }
 
