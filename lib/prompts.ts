@@ -14,7 +14,8 @@ XMPP bridge available. Do not use it from local/TUI prompts unless explicitly as
 
 const XMPP_TURN_SYSTEM_PROMPT_SUFFIX = `
 
-XMPP turn note: If context was compacted or you need the pi-xmpp bridge contract, call tool \`xmpp_help\`.`;
+This message came from XMPP. Use the \`xmpp_send\` tool to reply.
+For bridge help, call \`xmpp_help\`.`;
 
 const XMPP_HELP_TEXT = `--- XMPP BRIDGE HELP ---
 

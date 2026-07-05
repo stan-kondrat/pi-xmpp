@@ -386,7 +386,7 @@ export default function (pi: Pi.ExtensionAPI) {
   };
 
   // --- Dispatch next queued turn ---
-  const dispatchNextQueuedTurn = function (): void {
+  const dispatchNextQueuedTurn = async function (): Promise<void> {
     if (bridgeRuntime.state.xmppTurnDispatchPending) return;
     if (bridgeRuntime.state.compactionInProgress) return;
     if (activeTurnRuntime.has()) return;
@@ -408,9 +408,19 @@ export default function (pi: Pi.ExtensionAPI) {
     });
 
     try {
-      sendUserMessage(next.prompt);
+      await sendUserMessage(next.prompt);
     } catch (error: unknown) {
-      recordRuntimeEvent("dispatch", error);
+      const msg = error instanceof Error ? error.message : String(error);
+      // If Pi is busy, re-queue the message for later dispatch
+      if (msg.includes("already processing") || msg.includes("streamingBehavior")) {
+        recordRuntimeEvent("dispatch-retry", null, { id: next.id, from: next.turn.fromBare });
+        xmppQueueStore.enqueue(next); // put it back
+        bridgeRuntime.state.xmppTurnDispatchPending = false;
+        activeTurnRuntime.clear();
+        abort.clearHandler();
+        return;
+      }
+      recordRuntimeEvent("dispatch", error, { id: next.id });
       activeTurnRuntime.clear();
       bridgeRuntime.state.xmppTurnDispatchPending = false;
       abort.clearHandler();
