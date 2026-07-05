@@ -1,0 +1,325 @@
+/**
+ * XMPP bridge extension entrypoint and orchestration layer
+ * Zones: xmpp, pi agent, orchestration
+ * Keeps the runtime wiring in one place while delegating reusable domain logic to /lib modules
+ */
+
+import * as Pi from "./lib/pi.ts";
+import * as Commands from "./lib/commands.ts";
+import * as Config from "./lib/config.ts";
+import * as Inbound from "./lib/inbound.ts";
+import * as Lifecycle from "./lib/lifecycle.ts";
+import * as Model from "./lib/model.ts";
+import * as Outbound from "./lib/outbound.ts";
+import * as Prompts from "./lib/prompts.ts";
+import * as Queue from "./lib/queue.ts";
+import * as Routing from "./lib/routing.ts";
+import * as Runtime from "./lib/runtime.ts";
+import * as Status from "./lib/status.ts";
+import * as XmppApi from "./lib/xmpp-api.ts";
+import { Type } from "@sinclair/typebox";
+import * as Updates from "./api/updates.ts";
+
+// --- Extension Runtime ---
+
+export default function (pi: Pi.ExtensionAPI) {
+  const piRuntime = Pi.createExtensionApiRuntimePorts(pi);
+  const { sendUserMessage } = piRuntime;
+
+  // --- XMPP Client ---
+  const xmppClient = XmppApi.createXmppClient();
+
+  // --- Instance identity ---
+  const xmppInstanceId = `${process.pid}:${Date.now()}`;
+
+  // --- Runtime ---
+  const bridgeRuntime = Runtime.createXmppBridgeRuntime();
+  const { abort, lifecycle, queue } = bridgeRuntime;
+
+  // --- Config ---
+  const runtimeEvents = Status.createXmppRuntimeEventRecorder();
+  const configStore = Config.createXmppConfigStore({ recordRuntimeEvent: runtimeEvents.record });
+  Outbound.bindXmppRuntimeEventRecorder(runtimeEvents.record);
+
+  const recordRuntimeEvent = function (
+    category: string,
+    error: unknown,
+    details?: Record<string, unknown>,
+  ) {
+    runtimeEvents.record(category, error ?? undefined, details);
+  };
+
+  // --- Context store ---
+  const sessionContextStore = Lifecycle.createXmppSessionContextStore<Pi.ExtensionContext>();
+
+  // --- Active turn store ---
+  const activeTurnRuntime = Queue.createXmppActiveTurnStore();
+
+  // --- Queue store ---
+  const xmppQueueStore = Queue.createXmppQueueStore<Pi.ExtensionContext>();
+
+  // --- Status helpers ---
+  const getAllowedJid = () => configStore.getAllowedJid();
+  const getConnectionStatus = () => xmppClient.status;
+  const getActiveTurnFrom = () => activeTurnRuntime.get()?.fromBare;
+
+  const sendMessageToActiveTurn = async function (body: string): Promise<void> {
+    sendUserMessage(body);
+  };
+
+  // --- Incoming stanza handler ---
+  const handleIncomingStanza = async function (stanza: XmppApi.XmppStanza): Promise<void> {
+    // Run through update handlers first
+    const updateHandlers = Updates.getXmppUpdateHandlers();
+    for (const handler of updateHandlers) {
+      try {
+        const verdict = await handler(stanza);
+        if (verdict.handled) return;
+      } catch {
+        // Continue to next handler
+      }
+    }
+
+    // Route the stanza
+    const route = Routing.routeStanza(stanza);
+    if (!route) return;
+
+    if (route.kind === "message") {
+      await handleIncomingMessage(route);
+    } else if (route.kind === "presence") {
+      await handleIncomingPresence(route);
+    }
+  };
+
+  // --- Incoming message handler ---
+  const handleIncomingMessage = async function (route: Routing.XmppMessageRoute): Promise<void> {
+    // Skip error messages
+    if (route.type === "error") return;
+
+    // Check authorization
+    const auth = Config.getXmppAuthorizationState(
+      route.fromBare,
+      configStore.getAllowedJid(),
+    );
+
+    if (auth.kind === "deny") return;
+
+    // Auto-pair if needed
+    if (auth.kind === "pair") {
+      configStore.setAllowedJid(route.fromBare);
+      await configStore.persist();
+      recordRuntimeEvent("pair", null, { jid: route.fromBare });
+    }
+
+    // Process through inbound handler pipeline
+    const config = configStore.get();
+    const inboundResult = await Inbound.processXmppInbound(route, config);
+
+    // Build turn context
+    const turn: Queue.XmppTurnContext = {
+      from: route.from,
+      fromBare: route.fromBare,
+      body: inboundResult.rawText,
+      type: route.type,
+      thread: route.thread,
+      subject: route.subject,
+      isGroup: route.isGroup,
+      roomJid: route.roomJid,
+      senderNick: route.senderNick,
+      timestamp: Date.now(),
+    };
+
+    // Build prompt
+    const prompt = Queue.buildXmppTurnPrompt(turn, {
+      includeThread: true,
+      extraContext: inboundResult.handlerOutputs.length > 0
+        ? `handler outputs: ${inboundResult.handlerOutputs.join("; ")}`
+        : undefined,
+    });
+
+    // Enqueue the message
+    const ctx = sessionContextStore.get();
+    if (ctx) {
+      const item: Queue.XmppQueueItem<Pi.ExtensionContext> = {
+        id: `xmpp-${queue.allocateItemOrder()}-${Date.now()}`,
+        order: queue.allocateItemOrder(),
+        turn,
+        prompt,
+        ctx,
+        status: "queued",
+      };
+
+      xmppQueueStore.enqueue(item);
+      dispatchNextQueuedTurn();
+    }
+  };
+
+  // --- Incoming presence handler ---
+  const handleIncomingPresence = async function (
+    route: Routing.XmppPresenceRoute,
+  ): Promise<void> {
+    recordRuntimeEvent("presence", null, {
+      from: route.from,
+      type: route.type,
+      show: route.show,
+    });
+  };
+
+  // --- Dispatch next queued turn ---
+  const dispatchNextQueuedTurn = function (): void {
+    if (bridgeRuntime.state.xmppTurnDispatchPending) return;
+    if (bridgeRuntime.state.compactionInProgress) return;
+    if (activeTurnRuntime.has()) return;
+
+    const next = xmppQueueStore.dequeue();
+    if (!next) return;
+
+    bridgeRuntime.state.xmppTurnDispatchPending = true;
+    activeTurnRuntime.set(next.turn);
+
+    const ctx = next.ctx;
+
+    // Set abort handler
+    const abortController = new AbortController();
+    abort.setHandler(() => {
+      abortController.abort();
+      activeTurnRuntime.clear();
+      bridgeRuntime.state.xmppTurnDispatchPending = false;
+    });
+
+    // Send the prompt to Pi
+    // Note: activeTurnRuntime is cleared in onAgentEnd after the agent finishes processing
+    try {
+      sendUserMessage(next.prompt);
+    } catch (error: unknown) {
+      recordRuntimeEvent("dispatch", error);
+      activeTurnRuntime.clear();
+      bridgeRuntime.state.xmppTurnDispatchPending = false;
+      abort.clearHandler();
+    }
+  };
+
+  // --- Register slash commands ---
+  const allCommands = Commands.createXmppSlashCommands({
+    client: xmppClient,
+    configStore,
+    runtime: bridgeRuntime,
+    getConnectionStatus,
+    sendMessageToActiveTurn,
+    updateStatus: () => {
+      // Status is pushed declaratively via getConnectionStatus/getAllowedJid;
+      // individual commands that change state can call this to trigger a status refresh.
+    },
+    getAllowedJid,
+  });
+
+  for (const cmd of allCommands) {
+    pi.registerCommand(cmd.name, {
+      description: cmd.description,
+      handler: async (_args: string, _ctx: Pi.ExtensionCommandContext) => {
+        await cmd.handler({ args: [], rawArgs: _args });
+      },
+    });
+  }
+
+    // --- Register the xmpp_send tool ---
+  pi.registerTool({
+    name: "xmpp_send",
+    label: "Send XMPP Message",
+    description:
+      "Send a message via XMPP. Provide `to` (JID), `body` (message text), and optionally `type` (chat or groupchat).",
+    parameters: Type.Object({
+      to: Type.String({ description: "Recipient JID" }),
+      body: Type.String({ description: "Message body" }),
+      type: Type.Optional(Type.String({ description: "Message type (default: chat)" })),
+      subject: Type.Optional(Type.String({ description: "Optional message subject" })),
+    }),
+    execute: async (_toolCallId: string, params: { to: string; body: string; type?: string; subject?: string }) => {
+      try {
+        await Outbound.sendXmppMessage(xmppClient, params.to, params.body, {
+          type: params.type,
+          subject: params.subject,
+        });
+        return {
+          content: [{ type: "text" as const, text: `Message sent to ${params.to}` }],
+          details: {},
+        };
+      } catch (error: unknown) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Failed to send message: ${error instanceof Error ? error.message : String(error)}`,
+            },
+          ],
+          isError: true,
+          details: {},
+        };
+      }
+    },
+  });
+
+  // --- Register the xmpp_help tool ---
+  Prompts.registerXmppHelpTool(pi);
+
+  // --- Lifecycle hooks ---
+  const beforeAgentStartHook = Prompts.createXmppBeforeAgentStartHook();
+
+  Lifecycle.registerXmppLifecycleHooks(pi, {
+    onSessionStart: async (_event, ctx) => {
+      sessionContextStore.set(ctx);
+
+      // Try to auto-connect if credentials are stored
+      const config = configStore.get();
+      if (config.jid && config.password && xmppClient.status === "offline") {
+        try {
+          await xmppClient.connect(config);
+
+          // Auto-join configured rooms
+          if (config.autoJoinRooms?.length) {
+            const nick = config.jid.split("@")[0];
+            for (const room of config.autoJoinRooms) {
+              xmppClient.joinRoom(room, nick);
+            }
+          }
+        } catch (error) {
+          recordRuntimeEvent("auto-connect", error);
+        }
+      }
+    },
+
+    onSessionShutdown: async () => {
+      sessionContextStore.clear();
+    },
+
+    onBeforeAgentStart: async (event) => {
+      return beforeAgentStartHook(event);
+    },
+
+    onAgentStart: async () => {
+      // Agent started processing
+    },
+
+    onAgentEnd: async () => {
+      // Agent finished processing; clear active turn and dispatch next queued
+      activeTurnRuntime.clear();
+      bridgeRuntime.state.xmppTurnDispatchPending = false;
+      abort.clearHandler();
+      dispatchNextQueuedTurn();
+    },
+  });
+
+  // --- Stanza listener ---
+  xmppClient.onStanza(handleIncomingStanza);
+
+  // --- Record extension start ---
+  recordRuntimeEvent("extension-start", null, {
+    instanceId: xmppInstanceId,
+    pid: process.pid,
+  });
+
+  // --- Handle uncaught XMPP errors ---
+  xmppClient.onError((error) => {
+    recordRuntimeEvent("xmpp-error", error);
+  });
+}

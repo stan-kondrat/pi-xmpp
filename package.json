@@ -1,0 +1,71 @@
+{
+  "name": "pi-xmpp",
+  "version": "0.1.0",
+  "private": false,
+  "publishConfig": {
+    "access": "public"
+  },
+  "description": "XMPP runtime adapter for Pi",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "xmpp",
+    "chat",
+    "extension"
+  ],
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/stan-kondrat/pi-xmpp.git"
+  },
+  "homepage": "https://github.com/stan-kondrat/pi-xmpp",
+  "bugs": {
+    "url": "https://github.com/stan-kondrat/pi-xmpp/issues"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "audit": "npm audit",
+    "pack:check": "npm pack --dry-run",
+    "validate": "npm run typecheck && npm test && npm run audit && npm run pack:check"
+  },
+  "files": [
+    "index.ts",
+    "api/",
+    "lib/",
+    "README.md",
+    "AGENTS.md",
+    "BACKLOG.md",
+    "CHANGELOG.md"
+  ],
+  "exports": {
+    ".": "./index.ts",
+    "./inbound": "./api/inbound.ts",
+    "./outbound": "./api/outbound.ts",
+    "./updates": "./api/updates.ts",
+    "./commands": "./api/commands.ts",
+    "./status": "./api/status.ts"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "@xmpp/client": "^0.14.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@sinclair/typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "typescript": "latest"
+  }
+}
