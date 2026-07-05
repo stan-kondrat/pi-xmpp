@@ -152,6 +152,8 @@ export function createXmppClient(): XmppClientInstance {
 
       xmpp.on("online", (jid: { toString(): string }) => {
         currentJid = jid.toString();
+        // Send initial presence so the server routes messages to us
+        xmpp!.send(xml("presence", {})).catch(() => {});
       });
 
       xmpp.on("offline", () => {

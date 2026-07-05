@@ -245,6 +245,15 @@ export default function (pi: Pi.ExtensionAPI) {
 
   // --- Incoming stanza handler ---
   const handleIncomingStanza = async function (accountName: string, stanza: XmppApi.XmppStanza): Promise<void> {
+    // Debug: log message stanzas to confirm delivery
+    if (stanza.name === "message") {
+      recordRuntimeEvent("raw-stanza", null, {
+        account: accountName,
+        type: stanza.attrs.type ?? "",
+        from: (stanza.attrs.from ?? "").slice(0, 60),
+      });
+    }
+
     // Run through update handlers first
     const updateHandlers = Updates.getXmppUpdateHandlers();
     for (const handler of updateHandlers) {
