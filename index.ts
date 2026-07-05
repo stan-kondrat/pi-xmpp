@@ -261,6 +261,12 @@ export default function (pi: Pi.ExtensionAPI) {
     if (!route) return;
 
     if (route.kind === "message") {
+      recordRuntimeEvent("incoming-msg", null, {
+        account: accountName,
+        fromBare: route.fromBare,
+        type: route.type,
+        preview: route.body.slice(0, 60),
+      });
       await handleIncomingMessage(accountName, route);
     } else if (route.kind === "presence") {
       await handleIncomingPresence(route);
@@ -275,6 +281,13 @@ export default function (pi: Pi.ExtensionAPI) {
     // Get the account's config for auth
     const accountConfig = configStore.getAccountByName(accountName);
     const ownerJid = accountConfig?.ownerJid;
+
+    recordRuntimeEvent("auth-check", null, {
+      account: accountName,
+      fromBare: route.fromBare,
+      ownerJid: ownerJid ?? "(none)",
+      isGroup: String(route.isGroup),
+    });
 
     if (route.isGroup) {
       // In groupchats: if no owner is configured, anyone can participate.

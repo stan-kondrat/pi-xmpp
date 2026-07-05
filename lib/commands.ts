@@ -238,14 +238,13 @@ export function createXmppSlashCommands(deps: XmppSlashCommandsDeps) {
         lines.push(`**Owner JID:** ${ownerJid ?? "anyone (no restriction)"}`);
 
         // Show recent runtime events for debugging
-        const denied = events.filter((e) => e.category === "auth-deny" || e.category === "auth-pair");
-        if (denied.length > 0) {
+        if (events.length > 0) {
           lines.push(``);
-          lines.push(`**Recent auth events:**`);
-          for (const e of denied.slice(-5)) {
+          lines.push(`**Recent events (last ${Math.min(events.length, 8)}):**`);
+          for (const e of events.slice(-8)) {
             const time = new Date(e.timestamp).toLocaleTimeString();
-            const jid = e.details?.fromBare ?? "";
-            lines.push(`  [${time}] ${e.category}: ${jid}`);
+            const extra = e.details?.fromBare ?? e.details?.account ?? "";
+            lines.push(`  [${time}] ${e.category}${extra ? ` — ${extra}` : ""}${e.error ? ` (${e.error})` : ""}`);
           }
         }
 
