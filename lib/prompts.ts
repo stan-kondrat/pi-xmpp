@@ -8,14 +8,46 @@ import { Type } from "@sinclair/typebox";
 import type { BeforeAgentStartEvent, ExtensionAPI } from "./pi.ts";
 import { XMPP_PREFIX } from "./routing.ts";
 
+// ── Turn context types (subset of queue.ts for prompt building) ──
+
+export interface XmppActiveTurn {
+  accountName?: string;
+  isGroup: boolean;
+  roomJid?: string;
+  senderNick?: string;
+  fromBare: string;
+}
+
+// ── Prompt suffixes ──
+
 const LOCAL_SYSTEM_PROMPT_SUFFIX = `
 
-XMPP bridge available. Do not use it from local/TUI prompts unless explicitly asked.`;
+XMPP bridge available. You can send messages with the \`xmpp_send\` tool
+(e.g., to notify someone, answer a question, or forward results).
+Do not use it from local/TUI prompts unless the user explicitly asks.`;
 
-const XMPP_TURN_SYSTEM_PROMPT_SUFFIX = `
+function buildXmppTurnSystemPromptSuffix(turn?: XmppActiveTurn): string {
+  const parts: string[] = [];
+  parts.push("");
+  parts.push("This message came from XMPP.");
 
-This message came from XMPP. Use the \`xmpp_send\` tool to reply.
-For bridge help, call \`xmpp_help\`.`;
+  if (turn?.accountName) {
+    parts.push(`Account: ${turn.accountName}`);
+  }
+
+  if (turn?.isGroup) {
+    parts.push("⚠️ This is a groupchat — everyone in the room sees replies.");
+    if (turn.roomJid) parts.push(`Room: ${turn.roomJid}`);
+    if (turn.senderNick) parts.push(`Sender nickname: ${turn.senderNick}`);
+  } else {
+    parts.push("💬 This is a direct message — only the sender sees replies.");
+  }
+
+  parts.push("Reply by calling the \`xmpp_send\` tool — do NOT output text separately after the tool call.");
+  parts.push("For bridge help, call \`xmpp_help\`.");
+
+  return "\n\n" + parts.join("\n");
+}
 
 const XMPP_HELP_TEXT = `--- XMPP BRIDGE HELP ---
 
@@ -68,7 +100,7 @@ export function buildXmppBridgeSystemPrompt(options: {
   const isXmppTurn = trimmedPrompt.startsWith(xmppPrefix);
 
   const suffix = isXmppTurn
-    ? `${options.xmppTurnSystemPromptSuffix}\n- The current user message came from XMPP.`
+    ? options.xmppTurnSystemPromptSuffix
     : options.localSystemPromptSuffix;
 
   return {
@@ -80,7 +112,7 @@ export function createXmppBeforeAgentStartHook(
   options: {
     xmppPrefix?: string;
     localSystemPromptSuffix?: string;
-    xmppTurnSystemPromptSuffix?: string;
+    getActiveTurn?: () => XmppActiveTurn | undefined;
   } = {},
 ): (event: BeforeAgentStartEvent) => { systemPrompt: string } {
   return (event) =>
@@ -91,6 +123,6 @@ export function createXmppBeforeAgentStartHook(
       localSystemPromptSuffix:
         options.localSystemPromptSuffix ?? LOCAL_SYSTEM_PROMPT_SUFFIX,
       xmppTurnSystemPromptSuffix:
-        options.xmppTurnSystemPromptSuffix ?? XMPP_TURN_SYSTEM_PROMPT_SUFFIX,
+        buildXmppTurnSystemPromptSuffix(options.getActiveTurn?.()),
     });
 }

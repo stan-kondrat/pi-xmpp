@@ -5,9 +5,54 @@
  */
 
 import { existsSync } from "node:fs";
-import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, rmdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+
+// ── Auto-connect lock ──
+// Prevents multiple Pi instances from auto-connecting the same account.
+// Uses an atomic mkdir as a filesystem lock.
+
+const AUTO_CONNECT_LOCK = "xmpp-auto-connect.lock";
+
+function getLockDir(accountName: string, agentDir?: string): string {
+  return join(agentDir ?? getAgentDir(), AUTO_CONNECT_LOCK, accountName);
+}
+
+/**
+ * Try to acquire the auto-connect lock for a specific account atomically.
+ * Uses a per-account directory so different instances can auto-connect
+ * different accounts simultaneously.
+ * Returns true if this instance got the lock (should auto-connect).
+ * Returns false if another instance holds it (skip auto-connect).
+ */
+export async function tryAcquireAutoConnectLock(
+  accountName: string,
+  agentDir?: string,
+): Promise<boolean> {
+  const lockDir = getLockDir(accountName, agentDir);
+  await mkdir(resolve(lockDir, ".."), { recursive: true }); // ensure parent exists
+  try {
+    await mkdir(lockDir);
+    return true;
+  } catch {
+    return false; // another instance holds the lock for this account
+  }
+}
+
+/**
+ * Release the auto-connect lock for a specific account.
+ */
+export async function releaseAutoConnectLock(
+  accountName: string,
+  agentDir?: string,
+): Promise<void> {
+  try {
+    await rmdir(getLockDir(accountName, agentDir));
+  } catch {
+    // lock may already be gone
+  }
+}
 
 function getAgentDir(): string {
   return process.env.PI_CODING_AGENT_DIR
@@ -44,8 +89,10 @@ export interface XmppAccountConfig {
    *  When unset in DMs, the first sender is auto-paired. */
   ownerJid?: string;
   autoReconnect?: boolean;
+  /** Auto-connect this account on startup (default: false) */
+  autoConnect?: boolean;
   /** Single MUC room JID to auto-join on connect */
-  autoJoinRoom?: string;
+  roomJid?: string;
   inboundHandlers?: XmppInboundHandlerConfig[];
   outboundHandlers?: XmppOutboundHandlerConfig[];
   time?: XmppTimeConfig;
@@ -166,7 +213,12 @@ function normalizeAccountsFile(raw: Record<string, unknown>): {
     if (typeof f.ownerJid === "string") account.ownerJid = f.ownerJid;
 
     if (typeof f.autoReconnect === "boolean") account.autoReconnect = f.autoReconnect;
-    if (typeof f.autoJoinRoom === "string") account.autoJoinRoom = f.autoJoinRoom;
+    if (typeof f.autoConnect === "boolean") account.autoConnect = f.autoConnect;
+    // Backward compat: legacy auto → autoConnect
+    else if (typeof f.auto === "boolean") account.autoConnect = f.auto;
+    // Backward compat: legacy autoJoinRoom → roomJid
+    if (typeof f.roomJid === "string") account.roomJid = f.roomJid;
+    else if (typeof f.autoJoinRoom === "string") account.roomJid = f.autoJoinRoom;
 
     if (Object.keys(account).length > 0) {
       accounts.set("default", account);
@@ -190,7 +242,12 @@ function normalizeAccountsFile(raw: Record<string, unknown>): {
     if (typeof obj.ownerJid === "string") account.ownerJid = obj.ownerJid;
 
     if (typeof obj.autoReconnect === "boolean") account.autoReconnect = obj.autoReconnect;
-    if (typeof obj.autoJoinRoom === "string") account.autoJoinRoom = obj.autoJoinRoom;
+    if (typeof obj.autoConnect === "boolean") account.autoConnect = obj.autoConnect;
+    // Backward compat: legacy auto → autoConnect
+    else if (typeof obj.auto === "boolean") account.autoConnect = obj.auto;
+    // Backward compat: legacy autoJoinRoom → roomJid
+    if (typeof obj.roomJid === "string") account.roomJid = obj.roomJid;
+    else if (typeof obj.autoJoinRoom === "string") account.roomJid = obj.autoJoinRoom;
 
     accounts.set(key, account);
   }
@@ -342,7 +399,10 @@ export function createXmppConfigStore(
       }
     },
     getActiveAccountName: () => activeName,
-    getAutoConnect: () => true, // always auto-connect the default account
+    getAutoConnect: () => {
+      const active = getActive();
+      return active.autoConnect === true;
+    },
     getJid: () => getActive().jid,
     hasJid: () => !!getActive().jid,
     getOwnerJid: () => resolveOwnerJid(getActive()),

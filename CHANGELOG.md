@@ -16,6 +16,30 @@
 - [ ] **Config hot-reload** — Detect file changes to `~/.pi/agent/xmpp.json` without restart
 - [ ] **CLI `pi-xmpp` command** — Separate CLI tool for connection management outside Pi
 
+## 0.3.0
+
+### Config changes
+- **`autoJoinRoom` → `roomJid`** — Config field renamed; old `autoJoinRoom` key still read for backward compat
+- **`autoConnect` flag** — Per-account boolean to auto-connect on startup (default: `false`). Previously the default account was always auto-connected; now only accounts with `"autoConnect": true` are.
+- **`getAutoConnect()`** — Now respects the per-account `autoConnect` field instead of always returning `true`.
+
+### Prompt & routing improvements
+- **Dynamic XMPP turn context** — System prompt now injects account name, groupchat vs DM awareness (⚠️ everyone sees replies vs 💬 private), room JID, and sender nick per turn.
+- **Improved local prompt** — TUI/CLI agents are now told they *can* use `xmpp_send` to notify users or forward results.
+- **Command responses routed through XMPP** — Slash command responses (`/xmpp-status`, `/xmpp-connect`, etc.) are now sent back through XMPP to the original sender, not just to Pi's local session.
+- **Auto-routing of agent responses** — If the agent forgets to call `xmpp_send`, the bridge automatically sends the text response via XMPP using the account that received the message.
+- **Tool result includes confirmation** — `xmpp_send` now shows `📤 Message sent to ...` in the local chat.
+- **Tool + prompt guidance** — Agent is told to not produce extra text after calling `xmpp_send`.
+
+### Multi-instance safety
+- **Auto-connect instance lock** — Uses per-account atomic `mkdir` filesystem locks at `~/.pi/agent/xmpp-auto-connect.lock/{accountName}/`. Different Pi instances can auto-connect different accounts simultaneously. Manual `/xmpp-connect` bypasses the lock.
+- **Self-message echo suppression** — DM echoes (from matching bare JID) and groupchat echoes (from recently sent body cache) are filtered out to prevent loops.
+
+### Notifications
+- **Connect greeting** — Auto-connect sends `✅ XMPP bridge connected and ready` as a DM to the account's `ownerJid`.
+- **Local TUI notifications** — Auto-connect success/failure, auto-connect skipped (lock held), and auto-routed responses all show as `ctx.ui.notify()` notifications in the Pi TUI.
+- **Runtime events** — `auto-connect-success`, `auto-connect-skipped` events added for diagnostics via `/xmpp-status`.
+
 ## 0.2.0
 
 - **Multi-account config** — Config file now uses keyed-object format (`"default": {...}, "name": {...}`) instead of flat single-account format

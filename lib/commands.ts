@@ -78,7 +78,7 @@ export function createXmppSlashCommands(deps: XmppSlashCommandsDeps) {
         const domain = args.domain ?? args.d;
         const accountFlag = args.account ?? args.a;
         const ownerJid = args.ownerJid;
-        const autoJoinRoom = args.autoJoinRoom;
+        const roomJid = args.roomJid;
 
         // First bareword that isn't a flag is treated as the account name
         const bareword = extractFirstBareword(rawTrimmed);
@@ -121,7 +121,7 @@ export function createXmppSlashCommands(deps: XmppSlashCommandsDeps) {
             service: service || undefined,
             domain: domain || undefined,
             ownerJid: ownerJid || undefined,
-            autoJoinRoom: autoJoinRoom || undefined,
+            roomJid: roomJid || undefined,
           };
           deps.configStore.setActiveAccount(accountName);
           deps.configStore.set(config);
@@ -274,8 +274,8 @@ export function createXmppSlashCommands(deps: XmppSlashCommandsDeps) {
 
         // Save to the account's config
         const account = deps.configStore.getAccountByName(accountName);
-        if (account && !account.autoJoinRoom) {
-          account.autoJoinRoom = room;
+        if (account && !account.roomJid) {
+          account.roomJid = room;
           deps.configStore.setActiveAccount(accountName);
           deps.configStore.set(account);
           await deps.configStore.persist();
@@ -306,8 +306,8 @@ export function createXmppSlashCommands(deps: XmppSlashCommandsDeps) {
 
         // Clear from config if it's the auto-join room
         const account = deps.configStore.getAccountByName(accountName);
-        if (account && account.autoJoinRoom === room) {
-          delete account.autoJoinRoom;
+        if (account && account.roomJid === room) {
+          delete account.roomJid;
           deps.configStore.setActiveAccount(accountName);
           deps.configStore.set(account);
           await deps.configStore.persist();

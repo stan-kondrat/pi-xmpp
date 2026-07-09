@@ -123,8 +123,8 @@ export function formatXmppStatusSummary(deps: {
     lines.push(`**Configured accounts:** ${deps.accountsCount}`);
   }
 
-  if (deps.config.autoJoinRoom) {
-    lines.push(`**Auto-join room:** ${deps.config.autoJoinRoom}`);
+  if (deps.config.roomJid) {
+    lines.push(`**Auto-join room:** ${deps.config.roomJid}`);
   }
 
   if (deps.recentErrors?.length) {

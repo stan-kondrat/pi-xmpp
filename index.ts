@@ -16,7 +16,7 @@ import * as Routing from "./lib/routing.ts";
 import * as Runtime from "./lib/runtime.ts";
 import * as Status from "./lib/status.ts";
 import * as XmppApi from "./lib/xmpp-api.ts";
-import type { XmppConnectionStatus } from "./lib/xmpp-api.ts";
+import type { XmppConnectionStatus, ChatState } from "./lib/xmpp-api.ts";
 import { Type } from "@sinclair/typebox";
 import * as Updates from "./api/updates.ts";
 
@@ -34,6 +34,9 @@ function createXmppClientManager(
   const clients = new Map<string, ManagedClient>();
   // Track joined rooms per account: account → Map<roomJid, Set<occupantBareJid>>
   const joinedRooms = new Map<string, Map<string, Set<string>>>();
+  // Track recently sent message bodies per account to suppress groupchat echoes
+  const sentMessageBodies = new Map<string, Set<string>>();
+  const MAX_SENT_BODIES = 50;
 
   async function connectAccount(name: string, config: Config.XmppAccountConfig): Promise<void> {
     // Disconnect existing client for this name if any
@@ -52,6 +55,33 @@ function createXmppClientManager(
 
     // Wire stanza handler scoped to this account — also tracks room occupants
     client.onStanza((stanza) => {
+      // Skip echo of our own messages
+      if (stanza.name === "message") {
+        const ourBare = client.jid ? Routing.getBareJid(client.jid) : undefined;
+
+        // DM echo: from matches our own bare JID
+        if (ourBare && stanza.attrs.from && Routing.getBareJid(stanza.attrs.from) === ourBare) {
+          return;
+        }
+
+        // Groupchat echo: body matches a recently sent message
+        if (stanza.attrs.from) {
+          const bodyChild = (stanza.children ?? []).find(
+            (c): c is XmppApi.XmppStanza =>
+              typeof c === "object" && c !== null && (c as XmppApi.XmppStanza).name === "body",
+          );
+          if (bodyChild) {
+            const bodyText = bodyChild.children.find((c) => typeof c === "string");
+            if (typeof bodyText === "string") {
+              const bodies = sentMessageBodies.get(name);
+              if (bodies && bodies.has(bodyText)) {
+                return; // groupchat echo of our own message
+              }
+            }
+          }
+        }
+      }
+
       // Track MUC presence for occupant counting
       if (stanza.name === "presence" && stanza.attrs.from) {
         const fromBare = Routing.getBareJid(stanza.attrs.from);
@@ -85,9 +115,9 @@ function createXmppClientManager(
     await client.connect(connectConfig);
 
     // Auto-join room — use joinRoomOnAccount to initialize occupant tracking
-    if (config.autoJoinRoom) {
+    if (config.roomJid) {
       const nick = config.jid?.split("@")[0] ?? "pi";
-      joinRoomOnAccount(name, config.autoJoinRoom, nick);
+      joinRoomOnAccount(name, config.roomJid, nick);
     }
   }
 
@@ -149,6 +179,19 @@ function createXmppClientManager(
     clients.get(name)?.client.sendPresence(options);
   }
 
+  async function sendChatStateToAccount(name: string, to: string, state: ChatState): Promise<void> {
+    const entry = clients.get(name);
+    if (entry) {
+      await XmppApi.sendChatState(entry.client, to, state);
+    }
+  }
+
+  function sendPresenceToAll(options?: { show?: string; status?: string }): void {
+    for (const [name] of clients) {
+      clients.get(name)?.client.sendPresence(options);
+    }
+  }
+
   function getClientForTurn(accountName?: string): XmppApi.XmppClientInstance | undefined {
     if (accountName) return clients.get(accountName)?.client;
     // Fall back to first connected
@@ -175,6 +218,20 @@ function createXmppClientManager(
     };
   }
 
+  function getSentMessageBodies(accountName: string): Set<string> {
+    let bodies = sentMessageBodies.get(accountName);
+    if (!bodies) {
+      bodies = new Set();
+      sentMessageBodies.set(accountName, bodies);
+    }
+    // Evict old entries when limit is reached
+    if (bodies.size >= MAX_SENT_BODIES) {
+      const first = bodies.values().next().value;
+      if (first !== undefined) bodies.delete(first);
+    }
+    return bodies;
+  }
+
   return {
     connectAccount,
     disconnectAccount,
@@ -185,9 +242,12 @@ function createXmppClientManager(
     joinRoomOnAccount,
     leaveRoomOnAccount,
     sendPresenceOnAccount,
+    sendChatStateToAccount,
+    sendPresenceToAll,
     getClientForTurn,
     getJoinedRooms,
     getStatusDetail,
+    getSentMessageBodies,
   };
 }
 
@@ -231,8 +291,35 @@ export default function (pi: Pi.ExtensionAPI) {
   // --- Status helpers ---
   const getOwnerJid = () => configStore.getOwnerJid();
 
+  // Heartbeat timers for long-running agent turns
+  const heartbeatTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+  // Local notification function (set by command registration)
+  let localNotify: ((body: string, type?: "info" | "warning" | "error") => void) | undefined;
+
   const sendMessageToActiveTurn = async function (body: string): Promise<void> {
-    sendUserMessage(body);
+    const turn = activeTurnRuntime.get();
+    // If there's an active XMPP turn, reply through XMPP
+    if (turn) {
+      const client = turn.accountName
+        ? clientManager.getClientForTurn(turn.accountName)
+        : clientManager.getClientForTurn();
+      if (client) {
+        const to = turn.isGroup && turn.roomJid ? turn.roomJid : turn.fromBare;
+        const type = turn.isGroup ? "groupchat" : "chat";
+        // Track sent body so groupchat echo suppression works
+        if (turn.accountName) {
+          const bodies = clientManager.getSentMessageBodies(turn.accountName);
+          bodies.add(body);
+        }
+        await Outbound.sendXmppMessage(client, to, body, { type });
+        return;
+      }
+    }
+    // No active XMPP turn → show as local notification (no new agent turn)
+    if (localNotify) {
+      localNotify(body, "info");
+    }
   };
 
   // --- Create client manager ---
@@ -262,6 +349,48 @@ export default function (pi: Pi.ExtensionAPI) {
         if (verdict.handled) return;
       } catch {
         // Continue to next handler
+      }
+    }
+
+    // ── XEP-0184 / XEP-0333: Handle delivery receipts and chat markers ──
+    if (stanza.name === "message" && stanza.attrs.from) {
+      const fromBare = Routing.getBareJid(stanza.attrs.from);
+      const client = clientManager.getClientForTurn(accountName);
+
+      // If this IS a delivery receipt from the remote party (has <received>), log and drop
+      if (XmppApi.isDeliveryReceipt(stanza)) {
+        const receivedId = XmppApi.getReceivedId(stanza);
+        recordRuntimeEvent("delivery-receipt", null, {
+          from: fromBare,
+          msgId: receivedId ?? "(unknown)",
+        });
+        return;
+      }
+
+      // If this IS a chat marker from the remote party, log and drop
+      if (XmppApi.hasChatMarker(stanza) && !XmppApi.getMessageBody(stanza)) {
+        const marker = XmppApi.getChatMarker(stanza);
+        recordRuntimeEvent("chat-marker", null, {
+          from: fromBare,
+          marker: marker?.marker ?? "unknown",
+          id: marker?.id,
+        });
+        return;
+      }
+
+      // Message has a body + (optionally) receipt request and/or markable
+      const hasBody = !!XmppApi.getMessageBody(stanza);
+
+      // XEP-0184: Send delivery receipt if requested (on any message with an id)
+      if (hasBody && XmppApi.hasDeliveryReceiptRequest(stanza) && stanza.attrs.id && client) {
+        recordRuntimeEvent("send-receipt", null, { from: fromBare, msgId: stanza.attrs.id });
+        XmppApi.sendDeliveryReceipt(client, fromBare, stanza.attrs.id).catch(() => {});
+      }
+
+      // XEP-0333: Send "displayed" marker if message is markable and has a body
+      if (hasBody && XmppApi.hasMarkable(stanza) && stanza.attrs.id && client) {
+        recordRuntimeEvent("send-marker", null, { from: fromBare, marker: "displayed", msgId: stanza.attrs.id });
+        XmppApi.sendChatMarker(client, fromBare, "displayed", stanza.attrs.id).catch(() => {});
       }
     }
 
@@ -452,7 +581,13 @@ export default function (pi: Pi.ExtensionAPI) {
     pi.registerCommand(cmd.name, {
       description: cmd.description,
       handler: async (_args: string, _ctx: Pi.ExtensionCommandContext) => {
-        await cmd.handler({ args: [], rawArgs: _args });
+        // Capture local notify for sendMessageToActiveTurn fallback
+        localNotify = (body, type) => _ctx.ui.notify(body, type);
+        try {
+          await cmd.handler({ args: [], rawArgs: _args });
+        } finally {
+          localNotify = undefined;
+        }
       },
     });
   }
@@ -462,7 +597,7 @@ export default function (pi: Pi.ExtensionAPI) {
     name: "xmpp_send",
     label: "Send XMPP Message",
     description:
-      "Send a message via XMPP. Provide `to` (JID), `body` (message text), and optionally `type` (chat or groupchat). Replies go through the account that received the current turn.",
+      "Send a message via XMPP. Provide `to` (JID), `body` (message text), and optionally `type` (chat or groupchat). Replies go through the account that received the current turn. After calling this tool, do NOT produce any additional text — the message was already sent.",
     parameters: Type.Object({
       to: Type.String({ description: "Recipient JID" }),
       body: Type.String({ description: "Message body" }),
@@ -478,7 +613,7 @@ export default function (pi: Pi.ExtensionAPI) {
 
       if (!client) {
         return {
-          content: [{ type: "text" as const, text: "No XMPP account connected. Use /xmpp-connect first." }],
+          content: [{ type: "text" as const, text: `❌ No XMPP account connected. Message not sent: ${params.body}` }],
           isError: true,
           details: {},
         };
@@ -490,7 +625,7 @@ export default function (pi: Pi.ExtensionAPI) {
           subject: params.subject,
         });
         return {
-          content: [{ type: "text" as const, text: `Message sent to ${params.to}` }],
+          content: [{ type: "text" as const, text: `📤 Message sent to ${params.to}: ${params.body}` }],
           details: {},
         };
       } catch (error: unknown) {
@@ -512,7 +647,19 @@ export default function (pi: Pi.ExtensionAPI) {
   Prompts.registerXmppHelpTool(pi);
 
   // --- Lifecycle hooks ---
-  const beforeAgentStartHook = Prompts.createXmppBeforeAgentStartHook();
+  const beforeAgentStartHook = Prompts.createXmppBeforeAgentStartHook({
+    getActiveTurn: () => {
+      const turn = activeTurnRuntime.get();
+      if (!turn) return undefined;
+      return {
+        accountName: turn.accountName,
+        isGroup: turn.isGroup,
+        roomJid: turn.roomJid,
+        senderNick: turn.senderNick,
+        fromBare: turn.fromBare,
+      };
+    },
+  });
 
   Lifecycle.registerXmppLifecycleHooks(pi, {
     onSessionStart: async (_event, ctx) => {
@@ -521,13 +668,35 @@ export default function (pi: Pi.ExtensionAPI) {
       // Load config from disk before accessing accounts
       await configStore.load();
 
-      // Auto-connect the default account
-      const defaultAccount = configStore.getDefaultAccount();
-      if (defaultAccount?.jid && defaultAccount?.password) {
-        const name = defaultAccount.name ?? "default";
+      // Auto-connect accounts with autoConnect=true (per-account instance lock)
+      const allAccounts = configStore.getAccounts();
+      for (const account of allAccounts) {
+        if (!account.autoConnect || !account.jid || !account.password) continue;
+        const name = account.name ?? "default";
+        const hasLock = await Config.tryAcquireAutoConnectLock(name);
+        if (!hasLock) {
+          ctx.ui.notify(`ℹ️ XMPP auto-connect skipped: ${name} — another Pi instance already connected`, "info");
+          recordRuntimeEvent("auto-connect-skipped", null, { account: name, reason: "lock held by another instance" });
+          continue;
+        }
         try {
-          await clientManager.connectAccount(name, defaultAccount);
+          await clientManager.connectAccount(name, account);
+
+          // Local notification
+          ctx.ui.notify(`✅ XMPP connected: ${name} (${account.jid})`, "info");
+
+          // Send greeting to owner JID if configured
+          if (account.ownerJid) {
+            const client = clientManager.getClientForTurn(name);
+            if (client) {
+              const greeting = `✅ XMPP bridge connected and ready (account: ${name}, jid: ${account.jid})`;
+              await Outbound.sendXmppMessage(client, account.ownerJid, greeting, { type: "chat" }).catch(() => {});
+            }
+          }
+
+          recordRuntimeEvent("auto-connect-success", null, { account: name, jid: account.jid });
         } catch (error) {
+          ctx.ui.notify(`❌ XMPP connection failed: ${name}`, "error");
           recordRuntimeEvent("auto-connect", error, { account: name });
         }
       }
@@ -535,6 +704,15 @@ export default function (pi: Pi.ExtensionAPI) {
 
     onSessionShutdown: async () => {
       await clientManager.disconnectAccount();
+      // Release all per-account locks
+      const released = new Set<string>();
+      for (const account of configStore.getAccounts()) {
+        const name = account.name ?? "default";
+        if (!released.has(name)) {
+          await Config.releaseAutoConnectLock(name);
+          released.add(name);
+        }
+      }
       sessionContextStore.clear();
     },
 
@@ -543,10 +721,124 @@ export default function (pi: Pi.ExtensionAPI) {
     },
 
     onAgentStart: async () => {
-      // Agent started processing
+      const turn = activeTurnRuntime.get();
+      if (turn) {
+        const to = turn.isGroup && turn.roomJid ? turn.roomJid : turn.fromBare;
+        const client = turn.accountName
+          ? clientManager.getClientForTurn(turn.accountName)
+          : clientManager.getClientForTurn();
+
+        if (client && !turn.isGroup) {
+          // Derive a short preview from the user's message body for presence status
+          const bodyPreview = turn.body
+            .replace(/\n/g, " ")
+            .replace(/\s+/g, " ")
+            .trim()
+            .slice(0, 80);
+          const statusText = bodyPreview
+            ? `Processing: ${bodyPreview}${turn.body.length > 80 ? "…" : ""}`
+            : "Processing your request...";
+
+          // XEP-0085: Send active chat state to let the contact know we're processing
+          XmppApi.sendChatState(client, to, "active").catch(() => {});
+
+          // Set presence to dnd with the user's actual request as context
+          client.sendPresence({ show: "dnd", status: statusText });
+        }
+
+        // Long-task heartbeat: after 30s send a brief status if still running
+        const bodyPreview = turn.body
+          .replace(/\n/g, " ")
+          .replace(/\s+/g, " ")
+          .trim()
+          .slice(0, 60);
+        const heartbeatPreview = bodyPreview
+          ? `⏳ Still working on: ${bodyPreview}${turn.body.length > 60 ? "…" : ""}`
+          : "⏳ Still working on your request...";
+        const heartbeatId = `${turn.fromBare}:${turn.timestamp}`;
+        const heartbeatTimer = setTimeout(async () => {
+          heartbeatTimers.delete(heartbeatId);
+          const stillTurn = activeTurnRuntime.get();
+          if (stillTurn && client && !stillTurn.isGroup) {
+            try {
+              await Outbound.sendXmppMessage(
+                client,
+                to,
+                heartbeatPreview,
+                { type: "chat" },
+              );
+            } catch {
+              // Non-fatal
+            }
+          }
+        }, 30_000);
+        heartbeatTimers.set(heartbeatId, heartbeatTimer);
+      }
     },
 
-    onAgentEnd: async () => {
+    onAgentEnd: async (event, ctx) => {
+      const turn = activeTurnRuntime.get();
+      if (turn) {
+        // Clear heartbeat timer
+        const heartbeatId = `${turn.fromBare}:${turn.timestamp}`;
+        const timer = heartbeatTimers.get(heartbeatId);
+        if (timer) {
+          clearTimeout(timer);
+          heartbeatTimers.delete(heartbeatId);
+        }
+
+        // Send inactive chat state + restore presence
+        const to = turn.isGroup && turn.roomJid ? turn.roomJid : turn.fromBare;
+        const client = turn.accountName
+          ? clientManager.getClientForTurn(turn.accountName)
+          : clientManager.getClientForTurn();
+        if (client && !turn.isGroup) {
+          XmppApi.sendChatState(client, to, "inactive").catch(() => {});
+          client.sendPresence({ show: "chat", status: "Ready" });
+        }
+      }
+
+      // Auto-route agent's text response back through XMPP if it didn't call xmpp_send
+      if (turn) {
+        const msgs = event.messages as any[];
+        const hasXmppSend = msgs.some(
+          (m) =>
+            m.role === "assistant" &&
+            m.content?.some(
+              (c: any) => c.type === "toolCall" && c.name === "xmpp_send",
+            ),
+        );
+        if (!hasXmppSend) {
+          // Find the last assistant text response
+          const lastAssistant = [...msgs]
+            .reverse()
+            .find((m) => m.role === "assistant");
+          if (lastAssistant) {
+            const textParts: string[] = [];
+            for (const c of lastAssistant.content ?? []) {
+              if (c.type === "text" && c.text) textParts.push(c.text);
+            }
+            if (textParts.length > 0) {
+              const responseText = textParts.join("\n");
+              const client = turn.accountName
+                ? clientManager.getClientForTurn(turn.accountName)
+                : clientManager.getClientForTurn();
+              if (client) {
+                const to = turn.isGroup && turn.roomJid ? turn.roomJid : turn.fromBare;
+                const type = turn.isGroup ? "groupchat" : "chat";
+                try {
+                  await Outbound.sendXmppMessage(client, to, responseText, { type });
+                  const preview = responseText.length > 80 ? responseText.slice(0, 77) + "..." : responseText;
+                  ctx.ui.notify(`📤 Response sent via XMPP to ${to}: ${preview}`, "info");
+                } catch {
+                  // Auto-send failure is non-fatal
+                }
+              }
+            }
+          }
+        }
+      }
+
       activeTurnRuntime.clear();
       bridgeRuntime.state.xmppTurnDispatchPending = false;
       abort.clearHandler();
