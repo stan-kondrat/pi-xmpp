@@ -104,24 +104,28 @@ export function buildXmppTurnPrompt(
     extraContext?: string;
   },
 ): string {
+  // Sanitize helper: replace control chars and limit length
+  const safe = (s: string, maxLen = 200): string =>
+    s.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "").slice(0, maxLen);
+
   const parts: string[] = [];
-  parts.push(`[xmpp|from:${turn.from}]`);
+  parts.push(`[xmpp|from:${safe(turn.from, 120)}]`);
 
   if (turn.isGroup && turn.roomJid) {
-    parts.push(`[room:${turn.roomJid}]`);
-    if (turn.senderNick) parts.push(`[nick:${turn.senderNick}]`);
+    parts.push(`[room:${safe(turn.roomJid, 120)}]`);
+    if (turn.senderNick) parts.push(`[nick:${safe(turn.senderNick, 60)}]`);
   }
 
   if (turn.subject) {
-    parts.push(`[subject:${turn.subject}]`);
+    parts.push(`[subject:${safe(turn.subject, 200)}]`);
   }
 
   if (options?.includeThread && turn.thread) {
-    parts.push(`[thread:${turn.thread}]`);
+    parts.push(`[thread:${safe(turn.thread, 100)}]`);
   }
 
   if (options?.extraContext) {
-    parts.push(`[context:${options.extraContext}]`);
+    parts.push(`[context:${safe(options.extraContext, 500)}]`);
   }
 
   parts.push("");

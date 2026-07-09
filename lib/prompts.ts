@@ -27,18 +27,21 @@ XMPP bridge available. You can send messages with the \`xmpp_send\` tool
 Do not use it from local/TUI prompts unless the user explicitly asks.`;
 
 function buildXmppTurnSystemPromptSuffix(turn?: XmppActiveTurn): string {
+  const safe = (s: string, maxLen = 120): string =>
+    s.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "").slice(0, maxLen);
+
   const parts: string[] = [];
   parts.push("");
   parts.push("This message came from XMPP.");
 
   if (turn?.accountName) {
-    parts.push(`Account: ${turn.accountName}`);
+    parts.push(`Account: ${safe(turn.accountName, 60)}`);
   }
 
   if (turn?.isGroup) {
     parts.push("⚠️ This is a groupchat — everyone in the room sees replies.");
-    if (turn.roomJid) parts.push(`Room: ${turn.roomJid}`);
-    if (turn.senderNick) parts.push(`Sender nickname: ${turn.senderNick}`);
+    if (turn.roomJid) parts.push(`Room: ${safe(turn.roomJid, 120)}`);
+    if (turn.senderNick) parts.push(`Sender nickname: ${safe(turn.senderNick, 60)}`);
   } else {
     parts.push("💬 This is a direct message — only the sender sees replies.");
   }

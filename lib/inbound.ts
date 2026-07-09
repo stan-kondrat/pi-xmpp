@@ -137,8 +137,13 @@ export function matchesInboundHandler(
   return patterns.some((pattern) => {
     if (pattern.startsWith("/") && pattern.endsWith("/")) {
       // Regex pattern
-      const regex = new RegExp(pattern.slice(1, -1));
-      return regex.test(body);
+      try {
+        const regex = new RegExp(pattern.slice(1, -1));
+        return regex.test(body);
+      } catch {
+        // Invalid regex — fall through to simple match
+        return false;
+      }
     }
     // Glob/simple match
     return body.includes(pattern);

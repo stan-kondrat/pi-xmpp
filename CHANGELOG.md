@@ -16,6 +16,11 @@
 - [ ] **Config hot-reload** — Detect file changes to `~/.pi/agent/xmpp.json` without restart
 - [ ] **CLI `pi-xmpp` command** — Separate CLI tool for connection management outside Pi
 
+## 0.3.1
+
+### Fixes
+- **Reliable auto-reconnect** — Replaced reliance on `@xmpp/reconnect`'s one-shot retry with the bridge's own reconnect loop featuring exponential backoff (1s → 2s → 4s → … → 60s cap), proper error surfacing via `xmpp-error` events, and status reporting (`reconnecting`). On unexpected disconnect or failed initial connect, the bridge now retries indefinitely until the connection is restored or `disconnect()` is called explicitly. [#ECONNRESET]
+
 ## 0.3.0
 
 ### Config changes

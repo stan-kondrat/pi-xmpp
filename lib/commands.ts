@@ -214,7 +214,7 @@ export function createXmppSlashCommands(deps: XmppSlashCommandsDeps) {
         }
 
         for (const c of connected) {
-          const icon = c.status === "online" ? "🟢" : c.status === "connecting" ? "🟡" : "🔴";
+          const icon = c.status === "online" ? "🟢" : c.status === "connecting" || c.status === "reconnecting" ? "🟡" : "🔴";
           let line = `${icon} **${c.name}** — ${c.status}${c.jid ? ` (${c.jid})` : ""}`;
 
           // Show joined rooms with occupant counts
@@ -270,6 +270,16 @@ export function createXmppSlashCommands(deps: XmppSlashCommandsDeps) {
 
         const jid = deps.getClientJid(accountName);
         const nickname = nick ?? jid?.split("@")[0] ?? "pi";
+
+        // Verify the account is connected
+        const status = deps.getClientStatus(accountName);
+        if (status !== "online") {
+          await deps.sendMessageToActiveTurn(
+            `❌ Account "${accountName}" is not connected (status: ${status}). Use /xmpp-connect first.`,
+          );
+          return;
+        }
+
         deps.joinRoomOnAccount(accountName, room, nickname);
 
         // Save to the account's config
@@ -302,6 +312,15 @@ export function createXmppSlashCommands(deps: XmppSlashCommandsDeps) {
           return;
         }
 
+        // Verify the account is connected
+        const leaveStatus = deps.getClientStatus(accountName);
+        if (leaveStatus !== "online") {
+          await deps.sendMessageToActiveTurn(
+            `❌ Account "${accountName}" is not connected (status: ${leaveStatus}). Use /xmpp-connect first.`,
+          );
+          return;
+        }
+
         deps.leaveRoomOnAccount(accountName, room);
 
         // Clear from config if it's the auto-join room
@@ -325,13 +344,14 @@ export function createXmppSlashCommands(deps: XmppSlashCommandsDeps) {
         const show = args.show ?? args.s;
         const status = args.status ?? args.m;
         const connected = deps.getConnectedAccounts();
+        const onlineAccounts = connected.filter((name) => deps.getClientStatus(name) === "online");
 
-        if (connected.length === 0) {
+        if (onlineAccounts.length === 0) {
           await deps.sendMessageToActiveTurn("❌ No accounts connected.");
           return;
         }
 
-        for (const name of connected) {
+        for (const name of onlineAccounts) {
           deps.sendPresenceOnAccount(name, {
             show: show || undefined,
             status: status || undefined,
@@ -339,7 +359,7 @@ export function createXmppSlashCommands(deps: XmppSlashCommandsDeps) {
         }
 
         await deps.sendMessageToActiveTurn(
-          `🟢 Presence updated on ${connected.length} account(s): ${show ?? "available"}${status ? ` (${status})` : ""}`,
+          `🟢 Presence updated on ${onlineAccounts.length} account(s): ${show ?? "available"}${status ? ` (${status})` : ""}`,
         );
       },
     },

@@ -103,13 +103,12 @@ function createXmppClientManager(
 
     clients.set(name, { client, accountName: name });
 
-    // Build connect config
+    // Build connect config — reconnect is handled internally by the client
     const connectConfig: Config.XmppAccountConfig = {
       jid: config.jid,
       password: config.password,
       service: config.service,
       domain: config.domain,
-      autoReconnect: config.autoReconnect,
     };
 
     await client.connect(connectConfig);
@@ -251,6 +250,17 @@ function createXmppClientManager(
   };
 }
 
+// ── Helpers ──
+
+/** Collapse whitespace and truncate a string for preview display. */
+function sanitizePreview(text: string, maxLen: number): string {
+  return text
+    .replace(/\n/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxLen);
+}
+
 // ── Extension Runtime ──
 
 export default function (pi: Pi.ExtensionAPI) {
@@ -347,8 +357,12 @@ export default function (pi: Pi.ExtensionAPI) {
       try {
         const verdict = await handler(stanza);
         if (verdict.handled) return;
-      } catch {
-        // Continue to next handler
+      } catch (err) {
+        recordRuntimeEvent("update-handler-error", err, {
+          account: accountName,
+          stanzaName: stanza.name,
+          from: (stanza.attrs.from ?? "").slice(0, 60),
+        });
       }
     }
 
@@ -537,7 +551,7 @@ export default function (pi: Pi.ExtensionAPI) {
     });
 
     try {
-      await sendUserMessage(next.prompt);
+      await sendUserMessage(next.prompt, { deliverAs: "followUp" });
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : String(error);
       // If Pi is busy, re-queue the message for later dispatch
@@ -620,6 +634,12 @@ export default function (pi: Pi.ExtensionAPI) {
       }
 
       try {
+        // Track sent body for groupchat echo suppression
+        if (turn?.accountName && (params.type === "groupchat" || turn.isGroup)) {
+          const bodies = clientManager.getSentMessageBodies(turn.accountName);
+          bodies.add(params.body);
+        }
+
         await Outbound.sendXmppMessage(client, params.to, params.body, {
           type: params.type,
           subject: params.subject,
@@ -666,7 +686,15 @@ export default function (pi: Pi.ExtensionAPI) {
       sessionContextStore.set(ctx);
 
       // Load config from disk before accessing accounts
-      await configStore.load();
+      try {
+        await configStore.load();
+      } catch (error) {
+        ctx.ui.notify(
+          `⚠️ Failed to load XMPP config: ${error instanceof Error ? error.message : String(error)}`,
+          "warning",
+        );
+        recordRuntimeEvent("config-load-failed", error);
+      }
 
       // Auto-connect accounts with autoConnect=true (per-account instance lock)
       const allAccounts = configStore.getAccounts();
@@ -698,11 +726,19 @@ export default function (pi: Pi.ExtensionAPI) {
         } catch (error) {
           ctx.ui.notify(`❌ XMPP connection failed: ${name}`, "error");
           recordRuntimeEvent("auto-connect", error, { account: name });
+          // Release the lock so another instance can try
+          await Config.releaseAutoConnectLock(name).catch(() => {});
         }
       }
     },
 
     onSessionShutdown: async () => {
+      // Clear all heartbeat timers
+      for (const timer of heartbeatTimers.values()) {
+        clearTimeout(timer);
+      }
+      heartbeatTimers.clear();
+
       await clientManager.disconnectAccount();
       // Release all per-account locks
       const released = new Set<string>();
@@ -730,13 +766,9 @@ export default function (pi: Pi.ExtensionAPI) {
 
         if (client && !turn.isGroup) {
           // Derive a short preview from the user's message body for presence status
-          const bodyPreview = turn.body
-            .replace(/\n/g, " ")
-            .replace(/\s+/g, " ")
-            .trim()
-            .slice(0, 80);
-          const statusText = bodyPreview
-            ? `Processing: ${bodyPreview}${turn.body.length > 80 ? "…" : ""}`
+          const preview80 = sanitizePreview(turn.body, 80);
+          const statusText = preview80
+            ? `Processing: ${preview80}${turn.body.length > 80 ? "…" : ""}`
             : "Processing your request...";
 
           // XEP-0085: Send active chat state to let the contact know we're processing
@@ -744,35 +776,31 @@ export default function (pi: Pi.ExtensionAPI) {
 
           // Set presence to dnd with the user's actual request as context
           client.sendPresence({ show: "dnd", status: statusText });
-        }
 
-        // Long-task heartbeat: after 30s send a brief status if still running
-        const bodyPreview = turn.body
-          .replace(/\n/g, " ")
-          .replace(/\s+/g, " ")
-          .trim()
-          .slice(0, 60);
-        const heartbeatPreview = bodyPreview
-          ? `⏳ Still working on: ${bodyPreview}${turn.body.length > 60 ? "…" : ""}`
-          : "⏳ Still working on your request...";
-        const heartbeatId = `${turn.fromBare}:${turn.timestamp}`;
-        const heartbeatTimer = setTimeout(async () => {
-          heartbeatTimers.delete(heartbeatId);
-          const stillTurn = activeTurnRuntime.get();
-          if (stillTurn && client && !stillTurn.isGroup) {
-            try {
-              await Outbound.sendXmppMessage(
-                client,
-                to,
-                heartbeatPreview,
-                { type: "chat" },
-              );
-            } catch {
-              // Non-fatal
+          // Long-task heartbeat: after 30s send a brief status if still running
+          const preview60 = sanitizePreview(turn.body, 60);
+          const heartbeatPreview = preview60
+            ? `⏳ Still working on: ${preview60}${turn.body.length > 60 ? "…" : ""}`
+            : "⏳ Still working on your request...";
+          const heartbeatId = `${turn.fromBare}:${turn.timestamp}`;
+          const heartbeatTimer = setTimeout(async () => {
+            heartbeatTimers.delete(heartbeatId);
+            const stillTurn = activeTurnRuntime.get();
+            if (stillTurn && !stillTurn.isGroup) {
+              try {
+                await Outbound.sendXmppMessage(
+                  client,
+                  to,
+                  heartbeatPreview,
+                  { type: "chat" },
+                );
+              } catch {
+                // Non-fatal
+              }
             }
-          }
-        }, 30_000);
-        heartbeatTimers.set(heartbeatId, heartbeatTimer);
+          }, 30_000);
+          heartbeatTimers.set(heartbeatId, heartbeatTimer);
+        }
       }
     },
 
@@ -800,15 +828,18 @@ export default function (pi: Pi.ExtensionAPI) {
 
       // Auto-route agent's text response back through XMPP if it didn't call xmpp_send
       if (turn) {
-        const msgs = event.messages as any[];
-        const hasXmppSend = msgs.some(
-          (m) =>
-            m.role === "assistant" &&
-            m.content?.some(
-              (c: any) => c.type === "toolCall" && c.name === "xmpp_send",
-            ),
-        );
-        if (!hasXmppSend) {
+        const msgs = (event as any).messages;
+        const hasXmppSend = Array.isArray(msgs)
+          ? msgs.some(
+              (m: any) =>
+                m.role === "assistant" &&
+                Array.isArray(m.content) &&
+                m.content.some(
+                  (c: any) => c.type === "toolCall" && c.name === "xmpp_send",
+                ),
+            )
+          : false;
+        if (!hasXmppSend && Array.isArray(msgs)) {
           // Find the last assistant text response
           const lastAssistant = [...msgs]
             .reverse()

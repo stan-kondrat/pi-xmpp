@@ -66,10 +66,14 @@ export function isRoomJid(bareJid: string): boolean {
  * Build the XMPP prefix for Pi agent context
  */
 export function buildXmppPrefix(route: XmppMessageRoute): string {
-  const parts = [`${XMPP_PREFIX}|from:${route.from}`];
+  // Sanitize: strip control characters
+  const safe = (s: string, maxLen = 120): string =>
+    s.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "").slice(0, maxLen);
+
+  const parts = [`${XMPP_PREFIX}|from:${safe(route.from)}`];
   if (route.isGroup && route.roomJid) {
-    parts.push(`room:${route.roomJid}`);
-    if (route.senderNick) parts.push(`nick:${route.senderNick}`);
+    parts.push(`room:${safe(route.roomJid)}`);
+    if (route.senderNick) parts.push(`nick:${safe(route.senderNick, 60)}`);
   }
   return parts.join("|");
 }

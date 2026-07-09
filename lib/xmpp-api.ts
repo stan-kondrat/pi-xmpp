@@ -82,16 +82,21 @@ export interface XmppClientInstance {
   offStanza: (handler: (stanza: XmppStanza) => void) => void;
   onStatusChange: (handler: (status: XmppConnectionStatus) => void) => () => void;
   onError: (handler: (error: Error) => void) => () => void;
-  getRoster: () => Promise<Array<{ jid: string; name?: string; subscription?: string }>>;
 }
 
 export function createXmppClient(): XmppClientInstance {
   let xmpp: ReturnType<typeof client> | undefined;
   let currentStatus: XmppConnectionStatus = "offline";
   let currentJid: string | undefined;
+  let storedConfig: XmppConfig | undefined;
+  let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+  let reconnectAttempt = 0;
+  let explicitDisconnect = false;
   const stanzaHandlers: Array<(stanza: XmppStanza) => void> = [];
   const statusHandlers: Array<(status: XmppConnectionStatus) => void> = [];
   const errorHandlers: Array<(error: Error) => void> = [];
+
+  const MAX_RECONNECT_DELAY = 60_000; // 60s cap
 
   function setStatus(status: XmppConnectionStatus): void {
     currentStatus = status;
@@ -104,6 +109,110 @@ export function createXmppClient(): XmppClientInstance {
     }
   }
 
+  function cancelReconnect(): void {
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = undefined;
+    }
+    reconnectAttempt = 0;
+  }
+
+  async function doReconnect(): Promise<void> {
+    if (!storedConfig || explicitDisconnect) return;
+
+    const delay = Math.min(1000 * Math.pow(2, reconnectAttempt), MAX_RECONNECT_DELAY);
+    reconnectAttempt++;
+
+    setStatus("reconnecting");
+
+    reconnectTimer = setTimeout(async () => {
+      reconnectTimer = undefined;
+
+      if (explicitDisconnect || !storedConfig) return;
+
+      try {
+        // Disconnect old entity if still around
+        if (xmpp) {
+          try { await xmpp.stop(); } catch { /* ignore */ }
+          xmpp = undefined;
+        }
+
+        // Create a fresh client and connect
+        const config = storedConfig;
+        const parsedJid = parseJid(config.jid!);
+        const service = config.service ?? `xmpp://${parsedJid.domain}`;
+        const domain = config.domain ?? parsedJid.domain;
+
+        const newClient = client({
+          service,
+          domain,
+          username: parsedJid.local,
+          password: config.password,
+        });
+
+        // Re-register event handlers on the new entity
+        newClient.on("status", (status: string) => {
+          switch (status) {
+            case "online":
+              setStatus("online");
+              break;
+            case "offline":
+              setStatus("offline");
+              break;
+            case "connecting":
+              setStatus("connecting");
+              break;
+            case "disconnecting":
+              setStatus("disconnecting");
+              break;
+            case "disconnected":
+              setStatus("disconnected");
+              break;
+            default:
+              setStatus(status as XmppConnectionStatus);
+          }
+        });
+
+        newClient.on("error", (err: Error) => {
+          for (const handler of errorHandlers) {
+            try { handler(err); } catch { /* ignore */ }
+          }
+        });
+
+        newClient.on("online", (jid: { toString(): string }) => {
+          currentJid = jid.toString();
+          newClient.send(xml("presence", {})).catch(() => {});
+          // Reconnect succeeded — reset backoff
+          reconnectAttempt = 0;
+        });
+
+        newClient.on("offline", () => {
+          currentJid = undefined;
+        });
+
+        newClient.on("stanza", (stanza: unknown) => {
+          const s = stanza as XmppStanza;
+          for (const handler of stanzaHandlers) {
+            try { handler(s); } catch { /* ignore */ }
+          }
+        });
+
+        xmpp = newClient;
+        setStatus("connecting");
+        await newClient.start();
+      } catch (err) {
+        // Surface the error so the bridge can log it
+        for (const handler of errorHandlers) {
+          try {
+            handler(err instanceof Error ? err : new Error(String(err)));
+          } catch { /* ignore */ }
+        }
+        // Schedule next retry
+        doReconnect();
+      }
+    }, delay);
+  }
+
   return {
     get jid(): string | undefined {
       return currentJid;
@@ -113,6 +222,8 @@ export function createXmppClient(): XmppClientInstance {
     },
 
     async connect(config: XmppConfig): Promise<void> {
+      cancelReconnect();
+
       if (xmpp) {
         await this.disconnect();
       }
@@ -120,6 +231,10 @@ export function createXmppClient(): XmppClientInstance {
       if (!config.jid || !config.password) {
         throw new Error("JID and password are required to connect");
       }
+
+      // Store config for potential reconnection
+      storedConfig = config;
+      explicitDisconnect = false;
 
       const parsedJid = parseJid(config.jid);
       const service = config.service ?? `xmpp://${parsedJid.domain}`;
@@ -185,17 +300,34 @@ export function createXmppClient(): XmppClientInstance {
         }
       });
 
+      // Wire up auto-reconnect on unexpected disconnect
+      xmpp.on("disconnect", () => {
+        if (!explicitDisconnect) {
+          doReconnect();
+        }
+      });
+
       setStatus("connecting");
       try {
         await xmpp.start();
       } catch (error) {
         setStatus("offline");
+        // If the initial connection fails, start reconnection loop
+        if (!explicitDisconnect) {
+          doReconnect();
+        }
         throw error;
       }
     },
 
     async disconnect(): Promise<void> {
-      if (!xmpp) return;
+      explicitDisconnect = true;
+      cancelReconnect();
+      storedConfig = undefined;
+      if (!xmpp) {
+        setStatus("offline");
+        return;
+      }
       setStatus("disconnecting");
       try {
         await xmpp.stop();
@@ -303,11 +435,6 @@ export function createXmppClient(): XmppClientInstance {
       };
     },
 
-    async getRoster(): Promise<
-      Array<{ jid: string; name?: string; subscription?: string }>
-    > {
-      return [];
-    },
   };
 }
 

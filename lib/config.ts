@@ -5,7 +5,7 @@
  */
 
 import { existsSync } from "node:fs";
-import { chmod, mkdir, readFile, rename, rmdir, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -48,7 +48,7 @@ export async function releaseAutoConnectLock(
   agentDir?: string,
 ): Promise<void> {
   try {
-    await rmdir(getLockDir(accountName, agentDir));
+    await rm(getLockDir(accountName, agentDir), { recursive: true, force: true });
   } catch {
     // lock may already be gone
   }
