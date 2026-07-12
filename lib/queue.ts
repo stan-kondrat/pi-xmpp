@@ -6,6 +6,8 @@
 
 import type { ExtensionContext } from "./pi.ts";
 import type { XmppMessageRoute } from "./routing.ts";
+import { DEFAULT_XMPP_PROMPTS } from "./config.ts";
+import type { XmppPromptTemplates } from "./config.ts";
 
 export interface XmppTurnContext {
   from: string;
@@ -102,30 +104,32 @@ export function buildXmppTurnPrompt(
   options?: {
     includeThread?: boolean;
     extraContext?: string;
+    promptTemplates?: XmppPromptTemplates;
   },
 ): string {
+  const t = options?.promptTemplates ?? DEFAULT_XMPP_PROMPTS;
   // Sanitize helper: replace control chars and limit length
   const safe = (s: string, maxLen = 200): string =>
     s.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "").slice(0, maxLen);
 
   const parts: string[] = [];
-  parts.push(`[xmpp|from:${safe(turn.from, 120)}]`);
+  parts.push(t.turnFromLine(safe(turn.from, 120)));
 
   if (turn.isGroup && turn.roomJid) {
-    parts.push(`[room:${safe(turn.roomJid, 120)}]`);
-    if (turn.senderNick) parts.push(`[nick:${safe(turn.senderNick, 60)}]`);
+    parts.push(t.turnRoomLine(safe(turn.roomJid, 120)));
+    if (turn.senderNick) parts.push(t.turnNickLine(safe(turn.senderNick, 60)));
   }
 
   if (turn.subject) {
-    parts.push(`[subject:${safe(turn.subject, 200)}]`);
+    parts.push(t.turnSubjectLine(safe(turn.subject, 200)));
   }
 
   if (options?.includeThread && turn.thread) {
-    parts.push(`[thread:${safe(turn.thread, 100)}]`);
+    parts.push(t.turnThreadLine(safe(turn.thread, 100)));
   }
 
   if (options?.extraContext) {
-    parts.push(`[context:${safe(options.extraContext, 500)}]`);
+    parts.push(t.turnContextLine(safe(options.extraContext, 500)));
   }
 
   parts.push("");

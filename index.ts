@@ -20,6 +20,31 @@ import type { XmppConnectionStatus, ChatState } from "./lib/xmpp-api.ts";
 import { Type } from "@sinclair/typebox";
 import * as Updates from "./api/updates.ts";
 
+// ── Text Templates ──
+// prompts → returned as tool results, become LLM context
+// uiMessages → notifications / XMPP wire strings, never reach LLM
+import { DEFAULT_XMPP_PROMPTS, DEFAULT_XMPP_UI_MESSAGES } from "./lib/config.ts";
+
+const {
+  toolNoClient: TPL_TOOL_NO_CLIENT,
+  toolSent: TPL_TOOL_SENT,
+  toolSendFailed: TPL_TOOL_SEND_FAILED,
+} = DEFAULT_XMPP_PROMPTS;
+
+const {
+  configLoadFailed: TPL_CONFIG_LOAD_FAILED,
+  autoConnectSkipped: TPL_AUTO_CONNECT_SKIPPED,
+  connectedOk: TPL_CONNECTED_OK,
+  connectFailed: TPL_CONNECT_FAILED,
+  greeting: TPL_GREETING,
+  processingRequest: MSG_PROCESSING_REQUEST,
+  stillWorking: MSG_STILL_WORKING,
+  ready: MSG_READY,
+  processing: TPL_PROCESSING,
+  heartbeat: TPL_HEARTBEAT,
+  responseSent: TPL_RESPONSE_SENT,
+} = DEFAULT_XMPP_UI_MESSAGES;
+
 // ── Client Manager ──
 
 interface ManagedClient {
@@ -34,9 +59,33 @@ function createXmppClientManager(
   const clients = new Map<string, ManagedClient>();
   // Track joined rooms per account: account → Map<roomJid, Set<occupantBareJid>>
   const joinedRooms = new Map<string, Map<string, Set<string>>>();
+  // Track real JIDs of room occupants from MUC presence (XEP-0045):
+  // account → Map<roomJid, Map<nick, realJid>>
+  const roomOccupantRealJids = new Map<string, Map<string, Map<string, string>>>();
   // Track recently sent message bodies per account to suppress groupchat echoes
   const sentMessageBodies = new Map<string, Set<string>>();
   const MAX_SENT_BODIES = 50;
+
+  /**
+   * Extract the real JID from a MUC presence stanza.
+   * Non-anonymous rooms include <x xmlns='http://jabber.org/protocol/muc#user'>
+   * with <item jid='user@domain.tld/resource'/>.
+   */
+  function extractMucRealJid(stanza: XmppApi.XmppStanza): string | undefined {
+    const mucUserChild = (stanza.children ?? []).find(
+      (c): c is XmppApi.XmppStanza =>
+        typeof c === "object" && c !== null &&
+        (c as XmppApi.XmppStanza).name === "x" &&
+        (c as XmppApi.XmppStanza).attrs?.xmlns === "http://jabber.org/protocol/muc#user",
+    );
+    if (!mucUserChild) return undefined;
+    const itemChild = (mucUserChild.children ?? []).find(
+      (c): c is XmppApi.XmppStanza =>
+        typeof c === "object" && c !== null &&
+        (c as XmppApi.XmppStanza).name === "item",
+    );
+    return itemChild?.attrs?.jid;
+  }
 
   async function connectAccount(name: string, config: Config.XmppAccountConfig): Promise<void> {
     // Disconnect existing client for this name if any
@@ -82,14 +131,32 @@ function createXmppClientManager(
         }
       }
 
-      // Track MUC presence for occupant counting
+      // Track MUC presence for occupant counting and real JID extraction
       if (stanza.name === "presence" && stanza.attrs.from) {
         const fromBare = Routing.getBareJid(stanza.attrs.from);
         if (rooms.has(fromBare)) {
+          const nick = Routing.extractMucNick(stanza.attrs.from);
           if (stanza.attrs.type === "unavailable") {
             rooms.get(fromBare)!.delete(stanza.attrs.from);
+            // Also clean up real JID tracking
+            if (nick) {
+              const realJids = roomOccupantRealJids.get(name);
+              realJids?.get(fromBare)?.delete(nick);
+            }
           } else {
             rooms.get(fromBare)!.add(stanza.attrs.from);
+            // Extract and store real JID from MUC presence (XEP-0045)
+            const realJid = extractMucRealJid(stanza);
+            if (realJid && nick) {
+              if (!roomOccupantRealJids.has(name)) {
+                roomOccupantRealJids.set(name, new Map());
+              }
+              const accountRealJids = roomOccupantRealJids.get(name)!;
+              if (!accountRealJids.has(fromBare)) {
+                accountRealJids.set(fromBare, new Map());
+              }
+              accountRealJids.get(fromBare)!.set(nick, realJid);
+            }
           }
         }
       }
@@ -172,6 +239,7 @@ function createXmppClientManager(
     clients.get(name)?.client.leaveRoom(room);
     // Clean up occupant tracking
     joinedRooms.get(name)?.delete(room);
+    roomOccupantRealJids.get(name)?.delete(room);
   }
 
   function sendPresenceOnAccount(name: string, options?: { show?: string; status?: string; type?: string; to?: string }): void {
@@ -217,6 +285,10 @@ function createXmppClientManager(
     };
   }
 
+  function getRoomOccupantRealJid(accountName: string, roomJid: string, nick: string): string | undefined {
+    return roomOccupantRealJids.get(accountName)?.get(roomJid)?.get(nick);
+  }
+
   function getSentMessageBodies(accountName: string): Set<string> {
     let bodies = sentMessageBodies.get(accountName);
     if (!bodies) {
@@ -247,6 +319,7 @@ function createXmppClientManager(
     getJoinedRooms,
     getStatusDetail,
     getSentMessageBodies,
+    getRoomOccupantRealJid,
   };
 }
 
@@ -339,6 +412,105 @@ export default function (pi: Pi.ExtensionAPI) {
     },
     recordRuntimeEvent,
   );
+
+  // --- Bot command handler (runs after auth, before LLM) ---
+
+  async function handleBotCommand(
+    accountName: string,
+    route: Routing.XmppMessageRoute,
+    accountConfig: Config.XmppAccountConfig | undefined,
+  ): Promise<boolean> {
+    const body = route.body.trim();
+    if (!body.startsWith("!")) return false;
+
+    const compactRe = /^\s*!compact\b/i;
+    const modelsRe = /^\s*!models\b/i;
+    const modelRe = /^\s*!model\s+(\S+)/i;
+    const helpRe = /^\s*!help\b/i;
+
+    // Resolve templates for this account
+    const ui = configStore.getResolvedUiMessages(accountName);
+
+    // Get the XMPP client to send reply
+    const client = clientManager.getClientForTurn(accountName);
+    if (!client) return false;
+
+    const to = route.isGroup && route.roomJid ? route.roomJid : route.fromBare;
+    const type = route.isGroup ? "groupchat" : "chat";
+
+    // !compact — compact conversation history
+    if (compactRe.test(body)) {
+      recordRuntimeEvent("bot-command", null, { account: accountName, command: "compact" });
+      const ctx = sessionContextStore.get();
+      if (ctx) {
+        ctx.compact();
+      }
+      await Outbound.sendXmppMessage(client, to, "✅ Conversation compacted.", { type });
+      return true;
+    }
+
+    // !models — list available models
+    if (modelsRe.test(body)) {
+      recordRuntimeEvent("bot-command", null, { account: accountName, command: "models" });
+      const ctx = sessionContextStore.get();
+      let modelInfo = "Available models:\n";
+      if (ctx?.model) {
+        modelInfo += `  Current: ${ctx.model.provider}/${ctx.model.id}\n`;
+      }
+      // Try to list enabled models from settings
+      try {
+        const { createSettingsManager, getExtensionContextCwd } = await import("./lib/pi.ts");
+        const cwd = ctx ? getExtensionContextCwd(ctx) : process.cwd();
+        const settings = createSettingsManager(cwd);
+        const enabled = settings.getEnabledModels();
+        if (enabled && enabled.length > 0) {
+          modelInfo += `  Enabled patterns: ${enabled.join(", ")}`;
+        } else {
+          modelInfo += "  (no model filter — all configured models available)";
+        }
+      } catch {
+        modelInfo += "  (could not query model list)";
+      }
+      await Outbound.sendXmppMessage(client, to, modelInfo, { type });
+      return true;
+    }
+
+    // !model <id> — switch model
+    const modelMatch = modelRe.exec(body);
+    if (modelMatch) {
+      recordRuntimeEvent("bot-command", null, { account: accountName, command: "model", args: modelMatch[1] });
+      const modelArg = modelMatch[1];
+      // Support provider/model format
+      let provider = "default";
+      let modelId = modelArg;
+      if (modelArg.includes("/")) {
+        const parts = modelArg.split("/", 2);
+        provider = parts[0];
+        modelId = parts[1];
+      }
+      try {
+        const success = await piRuntime.setModel({ provider, id: modelId } as any);
+        if (success) {
+          await Outbound.sendXmppMessage(client, to, `✅ Model switched to ${provider}/${modelId}`, { type });
+        } else {
+          await Outbound.sendXmppMessage(client, to, `❌ No API key available for ${provider}/${modelId}`, { type });
+        }
+      } catch (error: unknown) {
+        const errMsg = error instanceof Error ? error.message : String(error);
+        await Outbound.sendXmppMessage(client, to, `❌ Failed to switch model: ${errMsg}`, { type });
+      }
+      return true;
+    }
+
+    // !help — show available commands
+    if (helpRe.test(body)) {
+      recordRuntimeEvent("bot-command", null, { account: accountName, command: "help" });
+      await Outbound.sendXmppMessage(client, to, ui.commandsHelp, { type });
+      return true;
+    }
+
+    return false;
+  }
 
   // --- Incoming stanza handler ---
   const handleIncomingStanza = async function (accountName: string, stanza: XmppApi.XmppStanza): Promise<void> {
@@ -444,9 +616,35 @@ export default function (pi: Pi.ExtensionAPI) {
     if (route.isGroup) {
       // In groupchats: if no owner is configured, anyone can participate.
       // If an owner is configured, only their messages are processed.
-      if (ownerJid && route.fromBare !== ownerJid) {
-        recordRuntimeEvent("auth-deny", null, { account: accountName, fromBare: route.fromBare, reason: "not owner in groupchat" });
-        return;
+      // The sender's identity is verified via their real JID extracted from
+      // MUC presence (XEP-0045) in non-anonymous rooms.
+      if (ownerJid) {
+        let senderRealJid: string | undefined;
+        if (route.roomJid && route.senderNick) {
+          senderRealJid = clientManager.getRoomOccupantRealJid(accountName, route.roomJid, route.senderNick);
+        }
+        if (!senderRealJid) {
+          // Could not resolve sender's real JID (anonymous room, or presence
+          // not yet received). Deny to be safe; the owner can still be reached
+          // via DM.
+          recordRuntimeEvent("auth-deny", null, {
+            account: accountName,
+            roomJid: route.roomJid,
+            senderNick: route.senderNick,
+            reason: "cannot resolve sender real JID",
+          });
+          return;
+        }
+        if (Routing.getBareJid(senderRealJid) !== ownerJid) {
+          recordRuntimeEvent("auth-deny", null, {
+            account: accountName,
+            roomJid: route.roomJid,
+            senderNick: route.senderNick,
+            senderRealJid: senderRealJid,
+            reason: "not owner in groupchat",
+          });
+          return;
+        }
       }
     } else {
       // Direct messages: use pairing/allow/deny
@@ -473,6 +671,10 @@ export default function (pi: Pi.ExtensionAPI) {
       }
     }
 
+    // ── Bot commands (intercepted before LLM prompt) ──
+    const handled = await handleBotCommand(accountName, route, accountConfig);
+    if (handled) return;
+
     // Process through inbound handler pipeline
     const config = accountConfig ?? {};
     const inboundResult = await Inbound.processXmppInbound(route, config, ownerJid);
@@ -492,12 +694,14 @@ export default function (pi: Pi.ExtensionAPI) {
       timestamp: Date.now(),
     };
 
-    // Build prompt
+    // Build prompt with resolved per-account template overrides
+    const resolvedPrompts = configStore.getResolvedPrompts(accountName);
     const prompt = Queue.buildXmppTurnPrompt(turn, {
       includeThread: true,
       extraContext: inboundResult.handlerOutputs.length > 0
         ? `handler outputs: ${inboundResult.handlerOutputs.join("; ")}`
         : undefined,
+      promptTemplates: resolvedPrompts,
     });
 
     // Enqueue the message
@@ -627,7 +831,7 @@ export default function (pi: Pi.ExtensionAPI) {
 
       if (!client) {
         return {
-          content: [{ type: "text" as const, text: `❌ No XMPP account connected. Message not sent: ${params.body}` }],
+          content: [{ type: "text" as const, text: TPL_TOOL_NO_CLIENT(params.body) }],
           isError: true,
           details: {},
         };
@@ -645,7 +849,7 @@ export default function (pi: Pi.ExtensionAPI) {
           subject: params.subject,
         });
         return {
-          content: [{ type: "text" as const, text: `📤 Message sent to ${params.to}: ${params.body}` }],
+          content: [{ type: "text" as const, text: TPL_TOOL_SENT(params.to, params.body) }],
           details: {},
         };
       } catch (error: unknown) {
@@ -653,7 +857,7 @@ export default function (pi: Pi.ExtensionAPI) {
           content: [
             {
               type: "text" as const,
-              text: `Failed to send message: ${error instanceof Error ? error.message : String(error)}`,
+              text: TPL_TOOL_SEND_FAILED(error instanceof Error ? error.message : String(error)),
             },
           ],
           isError: true,
@@ -679,6 +883,10 @@ export default function (pi: Pi.ExtensionAPI) {
         fromBare: turn.fromBare,
       };
     },
+    uiMessageTemplates: () => {
+      const turn = activeTurnRuntime.get();
+      return configStore.getResolvedUiMessages(turn?.accountName);
+    },
   });
 
   Lifecycle.registerXmppLifecycleHooks(pi, {
@@ -690,7 +898,7 @@ export default function (pi: Pi.ExtensionAPI) {
         await configStore.load();
       } catch (error) {
         ctx.ui.notify(
-          `⚠️ Failed to load XMPP config: ${error instanceof Error ? error.message : String(error)}`,
+          TPL_CONFIG_LOAD_FAILED(error instanceof Error ? error.message : String(error)),
           "warning",
         );
         recordRuntimeEvent("config-load-failed", error);
@@ -703,7 +911,7 @@ export default function (pi: Pi.ExtensionAPI) {
         const name = account.name ?? "default";
         const hasLock = await Config.tryAcquireAutoConnectLock(name);
         if (!hasLock) {
-          ctx.ui.notify(`ℹ️ XMPP auto-connect skipped: ${name} — another Pi instance already connected`, "info");
+          ctx.ui.notify(TPL_AUTO_CONNECT_SKIPPED(name), "info");
           recordRuntimeEvent("auto-connect-skipped", null, { account: name, reason: "lock held by another instance" });
           continue;
         }
@@ -711,20 +919,20 @@ export default function (pi: Pi.ExtensionAPI) {
           await clientManager.connectAccount(name, account);
 
           // Local notification
-          ctx.ui.notify(`✅ XMPP connected: ${name} (${account.jid})`, "info");
+          ctx.ui.notify(TPL_CONNECTED_OK(name, account.jid!), "info");
 
           // Send greeting to owner JID if configured
           if (account.ownerJid) {
             const client = clientManager.getClientForTurn(name);
             if (client) {
-              const greeting = `✅ XMPP bridge connected and ready (account: ${name}, jid: ${account.jid})`;
+              const greeting = TPL_GREETING(name, account.jid!);
               await Outbound.sendXmppMessage(client, account.ownerJid, greeting, { type: "chat" }).catch(() => {});
             }
           }
 
           recordRuntimeEvent("auto-connect-success", null, { account: name, jid: account.jid });
         } catch (error) {
-          ctx.ui.notify(`❌ XMPP connection failed: ${name}`, "error");
+          ctx.ui.notify(TPL_CONNECT_FAILED(name), "error");
           recordRuntimeEvent("auto-connect", error, { account: name });
           // Release the lock so another instance can try
           await Config.releaseAutoConnectLock(name).catch(() => {});
@@ -768,8 +976,8 @@ export default function (pi: Pi.ExtensionAPI) {
           // Derive a short preview from the user's message body for presence status
           const preview80 = sanitizePreview(turn.body, 80);
           const statusText = preview80
-            ? `Processing: ${preview80}${turn.body.length > 80 ? "…" : ""}`
-            : "Processing your request...";
+            ? TPL_PROCESSING(preview80, turn.body.length > 80)
+            : MSG_PROCESSING_REQUEST;
 
           // XEP-0085: Send active chat state to let the contact know we're processing
           XmppApi.sendChatState(client, to, "active").catch(() => {});
@@ -780,8 +988,8 @@ export default function (pi: Pi.ExtensionAPI) {
           // Long-task heartbeat: after 30s send a brief status if still running
           const preview60 = sanitizePreview(turn.body, 60);
           const heartbeatPreview = preview60
-            ? `⏳ Still working on: ${preview60}${turn.body.length > 60 ? "…" : ""}`
-            : "⏳ Still working on your request...";
+            ? TPL_HEARTBEAT(preview60, turn.body.length > 60)
+            : MSG_STILL_WORKING;
           const heartbeatId = `${turn.fromBare}:${turn.timestamp}`;
           const heartbeatTimer = setTimeout(async () => {
             heartbeatTimers.delete(heartbeatId);
@@ -822,7 +1030,7 @@ export default function (pi: Pi.ExtensionAPI) {
           : clientManager.getClientForTurn();
         if (client && !turn.isGroup) {
           XmppApi.sendChatState(client, to, "inactive").catch(() => {});
-          client.sendPresence({ show: "chat", status: "Ready" });
+          client.sendPresence({ show: "chat", status: MSG_READY });
         }
       }
 
@@ -860,7 +1068,7 @@ export default function (pi: Pi.ExtensionAPI) {
                 try {
                   await Outbound.sendXmppMessage(client, to, responseText, { type });
                   const preview = responseText.length > 80 ? responseText.slice(0, 77) + "..." : responseText;
-                  ctx.ui.notify(`📤 Response sent via XMPP to ${to}: ${preview}`, "info");
+                  ctx.ui.notify(TPL_RESPONSE_SENT(to, preview), "info");
                 } catch {
                   // Auto-send failure is non-fatal
                 }

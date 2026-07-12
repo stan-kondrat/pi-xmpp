@@ -7,6 +7,8 @@
 import { Type } from "@sinclair/typebox";
 import type { BeforeAgentStartEvent, ExtensionAPI } from "./pi.ts";
 import { XMPP_PREFIX } from "./routing.ts";
+import { DEFAULT_XMPP_UI_MESSAGES } from "./config.ts";
+import type { XmppUiMessageTemplates } from "./config.ts";
 
 // ── Turn context types (subset of queue.ts for prompt building) ──
 
@@ -18,61 +20,39 @@ export interface XmppActiveTurn {
   fromBare: string;
 }
 
-// ── Prompt suffixes ──
+// ── Prompt suffix builders ──
 
-const LOCAL_SYSTEM_PROMPT_SUFFIX = `
-
-XMPP bridge available. You can send messages with the \`xmpp_send\` tool
-(e.g., to notify someone, answer a question, or forward results).
-Do not use it from local/TUI prompts unless the user explicitly asks.`;
-
-function buildXmppTurnSystemPromptSuffix(turn?: XmppActiveTurn): string {
+function buildXmppTurnSystemPromptSuffix(
+  turn: XmppActiveTurn | undefined,
+  templates: XmppUiMessageTemplates = DEFAULT_XMPP_UI_MESSAGES,
+): string {
   const safe = (s: string, maxLen = 120): string =>
     s.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "").slice(0, maxLen);
 
   const parts: string[] = [];
   parts.push("");
-  parts.push("This message came from XMPP.");
+  parts.push(templates.systemIntro);
 
   if (turn?.accountName) {
-    parts.push(`Account: ${safe(turn.accountName, 60)}`);
+    parts.push(templates.systemAccount(safe(turn.accountName, 60)));
   }
 
   if (turn?.isGroup) {
-    parts.push("⚠️ This is a groupchat — everyone in the room sees replies.");
-    if (turn.roomJid) parts.push(`Room: ${safe(turn.roomJid, 120)}`);
-    if (turn.senderNick) parts.push(`Sender nickname: ${safe(turn.senderNick, 60)}`);
+    parts.push(templates.systemGroupchatWarning);
+    if (turn.roomJid) parts.push(templates.systemRoomLine(safe(turn.roomJid, 120)));
+    if (turn.senderNick) parts.push(templates.systemNickLine(safe(turn.senderNick, 60)));
   } else {
-    parts.push("💬 This is a direct message — only the sender sees replies.");
+    parts.push(templates.systemDirectMessage);
   }
 
-  parts.push("Reply by calling the \`xmpp_send\` tool — do NOT output text separately after the tool call.");
-  parts.push("For bridge help, call \`xmpp_help\`.");
+  parts.push(templates.systemReplyInstruction);
+  parts.push(templates.systemHelpInstruction);
 
   return "\n\n" + parts.join("\n");
 }
 
-const XMPP_HELP_TEXT = `--- XMPP BRIDGE HELP ---
-
-How to understand XMPP turns:
-- \`[xmpp|from:user@domain]\` marks XMPP origin and sender.
-- \`[room:room@conference]\` indicates a groupchat (MUC) message.
-- \`[nick:nickname]\` is the sender's nickname in a MUC room.
-- Reply to the user's current instruction, not quoted context.
-
-How to answer XMPP turns:
-- Reply in concise, scannable text.
-- For generated/requested files, mention the local path.
-
-Assistant-authored XMPP actions:
-- Use the \`xmpp_send\` tool to send direct messages or groupchat replies.
-
-Debugging pi-xmpp:
-- Inspect \`~/.pi/agent/tmp/xmpp/state.json\` for runtime state and diagnostics.
-- Use \`/xmpp-status\` for compact health information.`;
-
-export function getXmppHelpText(): string {
-  return XMPP_HELP_TEXT;
+export function getXmppHelpText(templates?: XmppUiMessageTemplates): string {
+  return (templates ?? DEFAULT_XMPP_UI_MESSAGES).helpText;
 }
 
 export function registerXmppHelpTool(pi: ExtensionAPI): void {
@@ -116,16 +96,24 @@ export function createXmppBeforeAgentStartHook(
     xmppPrefix?: string;
     localSystemPromptSuffix?: string;
     getActiveTurn?: () => XmppActiveTurn | undefined;
+    uiMessageTemplates?: XmppUiMessageTemplates | (() => XmppUiMessageTemplates);
   } = {},
 ): (event: BeforeAgentStartEvent) => { systemPrompt: string } {
-  return (event) =>
-    buildXmppBridgeSystemPrompt({
+  const resolveTemplates = (): XmppUiMessageTemplates => {
+    const t = options.uiMessageTemplates;
+    if (typeof t === "function") return t();
+    return t ?? DEFAULT_XMPP_UI_MESSAGES;
+  };
+  return (event) => {
+    const templates = resolveTemplates();
+    return buildXmppBridgeSystemPrompt({
       prompt: event.prompt,
       systemPrompt: event.systemPrompt,
       xmppPrefix: options.xmppPrefix,
       localSystemPromptSuffix:
-        options.localSystemPromptSuffix ?? LOCAL_SYSTEM_PROMPT_SUFFIX,
+        options.localSystemPromptSuffix ?? templates.localSuffix,
       xmppTurnSystemPromptSuffix:
-        buildXmppTurnSystemPromptSuffix(options.getActiveTurn?.()),
+        buildXmppTurnSystemPromptSuffix(options.getActiveTurn?.(), templates),
     });
+  };
 }

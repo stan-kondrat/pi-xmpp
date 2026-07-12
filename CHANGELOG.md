@@ -16,6 +16,57 @@
 - [ ] **Config hot-reload** — Detect file changes to `~/.pi/agent/xmpp.json` without restart
 - [ ] **CLI `pi-xmpp` command** — Separate CLI tool for connection management outside Pi
 
+## 0.4.0
+
+### MUC authorization fix
+- **Groupchat owner check now uses real JIDs** — Previously, the bridge compared the room JID
+  against `ownerJid`, which always failed. Now it extracts the sender's real JID from MUC
+  presence stanzas (XEP-0045 `<x xmlns='http://jabber.org/protocol/muc#user'><item jid='...'/></x>`)
+  and compares the sender's bare JID against `ownerJid`. Owner messages in non-anonymous
+  rooms now correctly pass authorization. [#BUG]
+- **Anonymous room safety** — When the sender's real JID cannot be resolved (anonymous room
+  or presence not yet received), the message is denied to prevent unauthorised access.
+
+### Config & template system
+- **`prompts` and `uiMessages` override config** — Config file now supports global and
+  per-account template overrides at `~/.pi/agent/xmpp.json`:
+  ```json
+  {
+    "prompts": { "toolNoClient": "Custom: {body}" },
+    "uiMessages": { "connectedOk": "✅ Bot ready as {jid}" },
+    "default": { "jid": "...", "prompts": { ... } }
+  }
+  ```
+  Merge order: `DEFAULTS ← global overrides ← per-account overrides`.
+- **`XmppPromptTemplates` / `XmppUiMessageTemplates`** — Split into two interfaces.
+  `prompts` are tool results returned to the LLM; `uiMessages` are UI notifications and
+  XMPP wire strings that never reach the LLM.
+- **`{placeholder}` interpolation** — JSON template strings use `{paramName}` syntax,
+  compiled to runtime functions via `compileXmppTemplate()`.
+- **Text templates extracted to config** — All user-facing strings moved from inline
+  template literals to `DEFAULT_XMPP_PROMPTS` / `DEFAULT_XMPP_UI_MESSAGES` consts in
+  `lib/config.ts`.
+
+### Bot commands
+- **Built-in bot commands** — `!compact`, `!models`, `!model <id>`, `!help` now work out of the box.
+  Commands run **after auth but before the LLM** — they never reach the agent prompt.
+- **`!compact`** — Triggers Pi session compaction via `ctx.compact()`.
+- **`!models`** — Shows the current model and enabled model patterns from Pi settings.
+- **`!model <id>`** — Switches the active model via `pi.setModel()`. Supports `provider/id`
+  format (e.g. `!model anthropic/claude-sonnet-4-20250514`).
+- **`!help`** — Replies with the configurable `commandsHelp` template.
+- **Owner-aware** — In supervised rooms (`ownerJid` set), only the owner can run commands.
+  In open rooms (no `ownerJid`), anyone can.
+- **`commandsHelp` template** — Default command list with `{placeholder}` syntax,
+  overridable per-account or globally in config.
+
+### Auth harness verification
+- **Auth gate invariant proven** — 13 new tests verify that unauthorized messages are
+  silently dropped before `sendUserMessage()` is called, that malicious JID manipulation
+  cannot bypass the string comparison, and that the queue remains empty for denied messages.
+- **Pipeline tracing** — End-to-end test traces the exact stage at which unauthorized
+  messages are stopped (`auth-checked`) vs authorized ones (`sent-to-llm`).
+
 ## 0.3.1
 
 ### Fixes

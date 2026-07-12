@@ -78,6 +78,93 @@ export interface ResolvedXmppTimeConfig {
 /**
  * Per-account XMPP configuration.
  */
+// ── Prompt templates (returned as tool results → become LLM context) ──
+
+export interface XmppPromptTemplates {
+  toolNoClient: (body: string) => string;
+  toolSent: (to: string, body: string) => string;
+  toolSendFailed: (err: string) => string;
+  // Turn header prefixes built into the user message prompt
+  turnFromLine: (from: string) => string;
+  turnRoomLine: (roomJid: string) => string;
+  turnNickLine: (nick: string) => string;
+  turnSubjectLine: (subject: string) => string;
+  turnThreadLine: (thread: string) => string;
+  turnContextLine: (ctx: string) => string;
+}
+
+export const DEFAULT_XMPP_PROMPTS: XmppPromptTemplates = {
+  toolNoClient: (body) => `❌ No XMPP account connected. Message not sent: ${body}`,
+  toolSent: (to, body) => `📤 Message sent to ${to}: ${body}`,
+  toolSendFailed: (err) => `Failed to send message: ${err}`,
+  turnFromLine: (from) => `[xmpp|from:${from}]`,
+  turnRoomLine: (roomJid) => `[room:${roomJid}]`,
+  turnNickLine: (nick) => `[nick:${nick}]`,
+  turnSubjectLine: (subject) => `[subject:${subject}]`,
+  turnThreadLine: (thread) => `[thread:${thread}]`,
+  turnContextLine: (ctx) => `[context:${ctx}]`,
+};
+
+// ── UI message templates (notifications / XMPP wire strings — never reach LLM) ──
+
+export interface XmppUiMessageTemplates {
+  configLoadFailed: (err: string) => string;
+  autoConnectSkipped: (name: string) => string;
+  connectedOk: (name: string, jid: string) => string;
+  connectFailed: (name: string) => string;
+  greeting: (name: string, jid: string) => string;
+  processingRequest: string;
+  stillWorking: string;
+  ready: string;
+  processing: (preview: string, truncated: boolean) => string;
+  heartbeat: (preview: string, truncated: boolean) => string;
+  responseSent: (to: string, preview: string) => string;
+  // System prompt instruction strings (injected into LLM context)
+  systemIntro: string;
+  systemAccount: (name: string) => string;
+  systemGroupchatWarning: string;
+  systemRoomLine: (roomJid: string) => string;
+  systemNickLine: (nick: string) => string;
+  systemDirectMessage: string;
+  systemReplyInstruction: string;
+  systemHelpInstruction: string;
+  localSuffix: string;
+  helpText: string;
+  commandsHelp: string;
+}
+
+export const DEFAULT_XMPP_UI_MESSAGES: XmppUiMessageTemplates = {
+  configLoadFailed: (err) => `⚠️ Failed to load XMPP config: ${err}`,
+  autoConnectSkipped: (name) => `ℹ️ XMPP auto-connect skipped: ${name} — another Pi instance already connected`,
+  connectedOk: (name, jid) => `✅ XMPP connected: ${name} (${jid})`,
+  connectFailed: (name) => `❌ XMPP connection failed: ${name}`,
+  greeting: (name, jid) => `✅ XMPP bridge connected and ready (account: ${name}, jid: ${jid})`,
+  processingRequest: "Processing your request...",
+  stillWorking: "⏳ Still working on your request...",
+  ready: "Ready",
+  processing: (preview, truncated) => `Processing: ${preview}${truncated ? "…" : ""}`,
+  heartbeat: (preview, truncated) => `⏳ Still working on: ${preview}${truncated ? "…" : ""}`,
+  responseSent: (to, preview) => `📤 Response sent via XMPP to ${to}: ${preview}`,
+  systemIntro: "This message came from XMPP.",
+  systemAccount: (name) => `Account: ${name}`,
+  systemGroupchatWarning: "⚠️ This is a groupchat — everyone in the room sees replies.",
+  systemRoomLine: (roomJid) => `Room: ${roomJid}`,
+  systemNickLine: (nick) => `Sender nickname: ${nick}`,
+  systemDirectMessage: "💬 This is a direct message — only the sender sees replies.",
+  systemReplyInstruction: "Reply by calling the \`xmpp_send\` tool — do NOT output text separately after the tool call.",
+  systemHelpInstruction: "For bridge help, call \`xmpp_help\`.",
+  localSuffix: "\n\nXMPP bridge available. You can send messages with the \`xmpp_send\` tool\n(e.g., to notify someone, answer a question, or forward results).\nDo not use it from local/TUI prompts unless the user explicitly asks.",
+  helpText: "--- XMPP BRIDGE HELP ---\n\nHow to understand XMPP turns:\n- \`[xmpp|from:user@domain]\` marks XMPP origin and sender.\n- \`[room:room@conference]\` indicates a groupchat (MUC) message.\n- \`[nick:nickname]\` is the sender's nickname in a MUC room.\n- When \`ownerJid\` is set, only the owner can send commands to rooms.\n- Reply to the user's current instruction, not quoted context.\n\nHow to answer XMPP turns:\n- Reply in concise, scannable text.\n- For generated/requested files, mention the local path.\n\nAssistant-authored XMPP actions:\n- Use the \`xmpp_send\` tool to send direct messages or groupchat replies.\n\nDebugging pi-xmpp:\n- Inspect \`~/.pi/agent/tmp/xmpp/state.json\` for runtime state and diagnostics.\n- Use \`/xmpp-status\` for compact health information.",
+  commandsHelp: [
+    "🤖 Bot commands:",
+    "  !compact    — Compact conversation history",
+    "  !models     — List all available AI models",
+    "  !model <id> — Switch AI model",
+    "  !help       — Show this message",
+    "Only the owner can use these commands.",
+  ].join("\n"),
+};
+
 export interface XmppAccountConfig {
   name?: string;
   jid?: string;
@@ -96,6 +183,10 @@ export interface XmppAccountConfig {
   inboundHandlers?: XmppInboundHandlerConfig[];
   outboundHandlers?: XmppOutboundHandlerConfig[];
   time?: XmppTimeConfig;
+  /** Override prompt templates returned as tool results (become LLM context). */
+  prompts?: Partial<XmppPromptTemplates>;
+  /** Override UI message templates (notifications / XMPP strings — never reach LLM). */
+  uiMessages?: Partial<XmppUiMessageTemplates>;
 }
 
 /** Active account config, resolved via XmppConfigStore.get(). */
@@ -153,6 +244,12 @@ export interface XmppConfigStore {
   setOwnerJid: (jid: string) => void;
   getInboundHandlers: () => XmppInboundHandlerConfig[] | undefined;
   getOutboundHandlers: () => XmppOutboundHandlerConfig[] | undefined;
+  /** Resolve prompt templates for a given account (or active account if omitted).
+   *  Merge order: defaults ← global overrides ← account overrides. */
+  getResolvedPrompts: (accountName?: string) => XmppPromptTemplates;
+  /** Resolve UI message templates for a given account (or active account if omitted).
+   *  Merge order: defaults ← global overrides ← account overrides. */
+  getResolvedUiMessages: (accountName?: string) => XmppUiMessageTemplates;
   load: () => Promise<void>;
   persist: (config?: XmppAccountsFile) => Promise<void>;
 }
@@ -182,6 +279,26 @@ function getInvalidXmppConfigRecoveryPath(configPath: string): string {
   return `${configPath}.invalid-${process.pid}-${Date.now()}`;
 }
 
+// ── Template string interpolation ──
+// Supports JSON config overrides with {placeholder} syntax.
+
+const INTERPOLATE_RE = /\{([a-zA-Z0-9_]+)\}/g;
+
+/**
+ * Compile a template string with {placeholder} syntax into a function.
+ * The function takes positional args matching the placeholder names in order.
+ */
+export function compileXmppTemplate<T extends string[]>(
+  template: string,
+  paramNames: readonly [...T],
+): (...args: { [K in keyof T]: string }) => string {
+  return (...args) =>
+    template.replace(INTERPOLATE_RE, (_, name) => {
+      const idx = paramNames.indexOf(name);
+      return idx >= 0 ? (args[idx] ?? "") : "";
+    });
+}
+
 /**
  * Check if a value looks like a legacy flat config (has XMPP fields at top level).
  */
@@ -189,18 +306,26 @@ function isLegacyFlatConfig(value: Record<string, unknown>): boolean {
   return typeof value.jid === "string" || typeof value.password === "string";
 }
 
+// Top-level global override keys (not account names)
+const GLOBAL_CONFIG_KEYS = new Set(["prompts", "uiMessages"]);
+
 /**
  * Normalize a loaded file into the keyed-accounts format.
+ * Extracts global prompts/uiMessages overrides from the top level.
  * Handles:
- *   { "default": { ... }, "work": { ... } }          — keyed format
- *   { "jid": "...", "password": "...", ... }          — legacy flat -> { "default": { ... } }
+ *   { "prompts": {...}, "uiMessages": {...}, "default": {...}, "work": {...} }  — keyed + global overrides
+ *   { "jid": "...", "password": "...", ... }                                      — legacy flat -> { "default": { ... } }
  */
 function normalizeAccountsFile(raw: Record<string, unknown>): {
   accounts: Map<string, XmppAccountConfig>;
   defaultName: string | undefined;
+  globalPrompts: Record<string, unknown> | undefined;
+  globalUiMessages: Record<string, unknown> | undefined;
 } {
   const accounts = new Map<string, XmppAccountConfig>();
   let defaultName: string | undefined;
+  let globalPrompts: Record<string, unknown> | undefined;
+  let globalUiMessages: Record<string, unknown> | undefined;
 
   if (isLegacyFlatConfig(raw)) {
     // Legacy flat format — wrap into "default"
@@ -224,11 +349,22 @@ function normalizeAccountsFile(raw: Record<string, unknown>): {
       accounts.set("default", account);
       defaultName = "default";
     }
-    return { accounts, defaultName };
+    return { accounts, defaultName, globalPrompts, globalUiMessages };
   }
 
-  // Keyed format: each key is an account name
+  // First pass: extract global overrides
+  for (const key of Object.keys(raw)) {
+    if (key === "prompts" && raw[key] && typeof raw[key] === "object" && !Array.isArray(raw[key])) {
+      globalPrompts = raw[key] as Record<string, unknown>;
+    }
+    if (key === "uiMessages" && raw[key] && typeof raw[key] === "object" && !Array.isArray(raw[key])) {
+      globalUiMessages = raw[key] as Record<string, unknown>;
+    }
+  }
+
+  // Second pass: extract accounts (skip global keys and invalid entries)
   for (const [key, value] of Object.entries(raw)) {
+    if (GLOBAL_CONFIG_KEYS.has(key)) continue;
     if (!value || typeof value !== "object" || Array.isArray(value)) continue;
     const obj = value as Record<string, unknown>;
     // Skip non-account keys (legacy flat leftovers that happen to be objects)
@@ -249,6 +385,14 @@ function normalizeAccountsFile(raw: Record<string, unknown>): {
     if (typeof obj.roomJid === "string") account.roomJid = obj.roomJid;
     else if (typeof obj.autoJoinRoom === "string") account.roomJid = obj.autoJoinRoom;
 
+    // Per-account template overrides
+    if (obj.prompts && typeof obj.prompts === "object" && !Array.isArray(obj.prompts)) {
+      account.prompts = obj.prompts as Partial<XmppPromptTemplates>;
+    }
+    if (obj.uiMessages && typeof obj.uiMessages === "object" && !Array.isArray(obj.uiMessages)) {
+      account.uiMessages = obj.uiMessages as Partial<XmppUiMessageTemplates>;
+    }
+
     accounts.set(key, account);
   }
 
@@ -259,7 +403,7 @@ function normalizeAccountsFile(raw: Record<string, unknown>): {
     defaultName = accounts.keys().next().value;
   }
 
-  return { accounts, defaultName };
+  return { accounts, defaultName, globalPrompts, globalUiMessages };
 }
 
 /**
@@ -270,8 +414,16 @@ export async function readXmppConfig(
   options: {
     onInvalidConfig?: (recovery: XmppInvalidConfigRecovery) => void;
   } = {},
-): Promise<{ raw: Record<string, unknown>; accounts: Map<string, XmppAccountConfig>; defaultName: string | undefined }> {
-  if (!existsSync(configPath)) return { raw: {}, accounts: new Map(), defaultName: undefined };
+): Promise<{
+  raw: Record<string, unknown>;
+  accounts: Map<string, XmppAccountConfig>;
+  defaultName: string | undefined;
+  globalPrompts: Record<string, unknown> | undefined;
+  globalUiMessages: Record<string, unknown> | undefined;
+}> {
+  if (!existsSync(configPath)) {
+    return { raw: {}, accounts: new Map(), defaultName: undefined, globalPrompts: undefined, globalUiMessages: undefined };
+  }
   const content = await readFile(configPath, "utf8");
   try {
     const raw = JSON.parse(content) as Record<string, unknown>;
@@ -281,7 +433,7 @@ export async function readXmppConfig(
     const recoveryPath = getInvalidXmppConfigRecoveryPath(configPath);
     await rename(configPath, recoveryPath);
     options.onInvalidConfig?.({ configPath, recoveryPath, error });
-    return { raw: {}, accounts: new Map(), defaultName: undefined };
+    return { raw: {}, accounts: new Map(), defaultName: undefined, globalPrompts: undefined, globalUiMessages: undefined };
   }
 }
 
@@ -339,6 +491,8 @@ export function createXmppConfigStore(
   );
   let defaultName: string | undefined = accountsMap.has("default") ? "default" : undefined;
   let activeName: string | undefined = defaultName;
+  let globalPromptOverrides: Partial<XmppPromptTemplates> | undefined;
+  let globalUiMessageOverrides: Partial<XmppUiMessageTemplates> | undefined;
   const agentDir = options.agentDir ?? getAgentDir();
   const configPath = options.configPath ?? getConfigPath();
 
@@ -427,12 +581,109 @@ export function createXmppConfigStore(
       accountsMap = result.accounts;
       defaultName = result.defaultName;
       activeName = defaultName;
+      // Load global template overrides from config file
+      if (result.globalPrompts) {
+        globalPromptOverrides = result.globalPrompts as Partial<XmppPromptTemplates>;
+      }
+      if (result.globalUiMessages) {
+        globalUiMessageOverrides = result.globalUiMessages as Partial<XmppUiMessageTemplates>;
+      }
     },
     persist: async () => {
       const file = buildPersistableFile(accountsMap);
       await writeXmppConfig(agentDir, configPath, file);
     },
+    getResolvedPrompts: (accountName?: string) => {
+      const account = accountName
+        ? accountsMap.get(accountName)
+        : getActive();
+      return applyTemplateOverrides(
+        DEFAULT_XMPP_PROMPTS as unknown as Record<string, unknown>,
+        PROMPT_PARAMS as Record<string, string[] | null>,
+        globalPromptOverrides as Record<string, unknown> | undefined,
+        account?.prompts as Record<string, unknown> | undefined,
+      ) as unknown as XmppPromptTemplates;
+    },
+    getResolvedUiMessages: (accountName?: string) => {
+      const account = accountName
+        ? accountsMap.get(accountName)
+        : getActive();
+      return applyTemplateOverrides(
+        DEFAULT_XMPP_UI_MESSAGES as unknown as Record<string, unknown>,
+        UI_MESSAGE_PARAMS as Record<string, string[] | null>,
+        globalUiMessageOverrides as Record<string, unknown> | undefined,
+        account?.uiMessages as Record<string, unknown> | undefined,
+      ) as unknown as XmppUiMessageTemplates;
+    },
   };
+}
+
+// ── Template override resolution ──
+// Maps each template key to its function parameter names.
+// null means the key is a static string, not a template function.
+
+const PROMPT_PARAMS: Record<keyof XmppPromptTemplates, string[]> = {
+  toolNoClient: ["body"],
+  toolSent: ["to", "body"],
+  toolSendFailed: ["err"],
+  turnFromLine: ["from"],
+  turnRoomLine: ["roomJid"],
+  turnNickLine: ["nick"],
+  turnSubjectLine: ["subject"],
+  turnThreadLine: ["thread"],
+  turnContextLine: ["ctx"],
+};
+
+const UI_MESSAGE_PARAMS: Record<keyof XmppUiMessageTemplates, string[] | null> = {
+  configLoadFailed: ["err"],
+  autoConnectSkipped: ["name"],
+  connectedOk: ["name", "jid"],
+  connectFailed: ["name"],
+  greeting: ["name", "jid"],
+  processingRequest: null,
+  stillWorking: null,
+  ready: null,
+  processing: ["preview", "truncated"],
+  heartbeat: ["preview", "truncated"],
+  responseSent: ["to", "preview"],
+  systemIntro: null,
+  systemAccount: ["name"],
+  systemGroupchatWarning: null,
+  systemRoomLine: ["roomJid"],
+  systemNickLine: ["nick"],
+  systemDirectMessage: null,
+  systemReplyInstruction: null,
+  systemHelpInstruction: null,
+  localSuffix: null,
+  helpText: null,
+  commandsHelp: null,
+};
+
+/**
+ * Deep-merge template overrides on top of defaults.
+ * Global overrides are applied first, then per-account overrides.
+ * String values from JSON with {placeholder} syntax are compiled to functions.
+ */
+function applyTemplateOverrides(
+  defaults: Record<string, unknown>,
+  paramMap: Record<string, string[] | null>,
+  ...overrides: (Record<string, unknown> | undefined)[]
+): Record<string, unknown> {
+  const result = { ...defaults };
+  for (const override of overrides) {
+    if (!override) continue;
+    for (const key of Object.keys(override)) {
+      const val = override[key];
+      if (val === undefined || val === null) continue;
+      const params = paramMap[key];
+      if (params === null) {
+        result[key] = String(val);
+      } else if (Array.isArray(params)) {
+        result[key] = compileXmppTemplate(String(val), params);
+      }
+    }
+  }
+  return result;
 }
 
 function getSystemTimezone(): string {

@@ -14,7 +14,7 @@ The bridge works in three modes depending on how you configure `ownerJid` and `r
 |------|------------|-----------------|-----------|
 | **Direct messaging** | set | empty | Only the owner can DM the bot. No room participation. |
 | **Open room** | empty | set | Anyone in the room can send commands to the bot. |
-| **Supervised room** | set | set | Everyone in the room sees all output, but only the owner can send commands. |
+| **Supervised room** | set | set | Everyone in the room sees all output, but only the owner can send commands. Auth uses the sender's real JID extracted from MUC presence (XEP-0045) in non-anonymous rooms. In anonymous rooms, all messages are denied. |
 
 ## Features
 
@@ -28,6 +28,8 @@ The bridge works in three modes depending on how you configure `ownerJid` and `r
 - **Connect Greeting** — Sends a ready notification DM to `ownerJid` on auto-connect
 - **Auto-routing** — If the agent forgets to call `xmpp_send`, the bridge automatically routes its text response back through XMPP
 - **Multi-instance safety** — Atomic filesystem lock prevents multiple Pi instances from auto-connecting the same account
+- **Text template system** — All user-facing strings are configurable via `prompts` (→ LLM) and `uiMessages` (→ notifications/XMPP wire) in `~/.pi/agent/xmpp.json` with `{placeholder}` interpolation
+- **Auth harness** — Authorization checks happen in the bridge runtime before any message reaches the LLM; 13 dedicated tests verify this invariant
 - **Companion Extension API** — Register inbound/outbound handlers, status providers, and slash commands
 
 ## Install
@@ -154,7 +156,6 @@ On successful auto-connect, if the account has an `ownerJid`, the bridge sends a
     "password": "secret",
     "service": "xmpp://server.tld",
     "domain": "server.tld",
-    "resource": "pi-bridge",
     "ownerJid": "trusted@domain.tld",
     "autoReconnect": true,
     "roomJid": "room@conference.tld"
@@ -165,6 +166,114 @@ On successful auto-connect, if the account has an `ownerJid`, the bridge sends a
   }
 }
 ```
+
+### Text Templates (`prompts` / `uiMessages`)
+
+All user-facing strings are configurable. The config file supports both **global** and
+**per-account** overrides with `{placeholder}` interpolation:
+
+```json
+{
+  // global overrides (optional)
+  "prompts": {
+    "toolNoClient": "Custom offline message: {body}",
+    "toolSent": "📤 Sent to {to}: {body}",
+    "toolSendFailed": "Send error: {err}",
+    "turnFromLine": "[xmpp|from:{from}]",
+    "turnRoomLine": "[room:{roomJid}]",
+    "turnNickLine": "[nick:{nick}]"
+  },
+  "uiMessages": {
+    "configLoadFailed": "Config error: {err}",
+    "autoConnectSkipped": "Skipped {name}: another instance connected",
+    "connectedOk": "✅ Bot ready as {jid}",
+    "connectFailed": "❌ Failed: {name}",
+    "greeting": "Hello {name} at {jid}",
+    "processingRequest": "Working on it...",
+    "stillWorking": "⏳ Still working...",
+    "ready": "Idle",
+    "processing": "Thinking: {preview}",
+    "heartbeat": "Still on: {preview}",
+    "responseSent": "✅ Replied to {to}: {preview}",
+    "systemIntro": "Message from XMPP.",
+    "systemAccount": "Account: {name}",
+    "systemGroupchatWarning": "⚠️ Groupchat — everyone sees replies.",
+    "systemRoomLine": "Room: {roomJid}",
+    "systemNickLine": "Sender: {nick}",
+    "systemDirectMessage": "💬 Direct message — private.",
+    "systemReplyInstruction": "Reply via \`xmpp_send\` tool.",
+    "systemHelpInstruction": "See \`xmpp_help\` for details.",
+    "localSuffix": "\n\nXMPP bridge available.",
+    "helpText": "--- XMPP BRIDGE HELP ---\n... (full text below)",
+    "commandsHelp": "🤖 Bot commands:\n... (full text below)"
+  },
+
+  // per-account overrides (optional, merge on top of global)
+  "default": {
+    "jid": "user@domain.tld",
+    "password": "secret",
+    "prompts": {
+      "toolSent": "✅ Sent to {to}: {body}"
+    }
+  }
+}
+```
+
+**Merge order:** `DEFAULTS ← global overrides ← per-account overrides`
+
+The default `helpText` (shown by the `xmpp_help` tool) is:
+
+```
+--- XMPP BRIDGE HELP ---
+
+How to understand XMPP turns:
+- [xmpp|from:user@domain] marks XMPP origin and sender.
+- [room:room@conference] indicates a groupchat (MUC) message.
+- [nick:nickname] is the sender's nickname in a MUC room.
+- When ownerJid is set, only the owner can send commands to rooms.
+- Reply to the user's current instruction, not quoted context.
+
+How to answer XMPP turns:
+- Reply in concise, scannable text.
+- For generated/requested files, mention the local path.
+
+Assistant-authored XMPP actions:
+- Use the xmpp_send tool to send direct messages or groupchat replies.
+
+Debugging pi-xmpp:
+- Inspect ~/.pi/agent/tmp/xmpp/state.json for runtime state and diagnostics.
+- Use /xmpp-status for compact health information.
+```
+
+The default `commandsHelp` (sent on room join or DM by companion plugins) is:
+
+```
+🤖 Bot commands:
+  !compact    — Compact conversation history
+  !models     — List all available AI models
+  !model <id> — Switch AI model
+  !help       — Show this message
+Only the owner can use these commands.
+```
+
+**`prompts`** — tool results + turn prefixes (become part of LLM conversation context):
+- `toolNoClient` — `❌ No XMPP account connected. Message not sent: {body}`
+- `toolSent` — `📤 Message sent to {to}: {body}`
+- `toolSendFailed` — `Failed to send message: {err}`
+- `turnFromLine` — `[xmpp|from:{from}]`
+- `turnRoomLine` — `[room:{roomJid}]`
+- `turnNickLine` — `[nick:{nick}]`
+- `turnSubjectLine` — `[subject:{subject}]`
+- `turnThreadLine` — `[thread:{thread}]`
+- `turnContextLine` — `[context:{ctx}]`
+
+**`uiMessages`** — UI notifications, XMPP wire strings, and system prompt instructions (never reach the LLM as user messages):
+- `configLoadFailed`, `autoConnectSkipped`, `connectedOk`, `connectFailed`
+- `greeting`, `processingRequest`, `stillWorking`, `ready`
+- `processing`, `heartbeat`, `responseSent`
+- `systemIntro`, `systemAccount`, `systemGroupchatWarning`, `systemRoomLine`, `systemNickLine`
+- `systemDirectMessage`, `systemReplyInstruction`, `systemHelpInstruction`
+- `localSuffix`, `helpText`, `commandsHelp`
 
 ### Fields
 
@@ -178,6 +287,8 @@ On successful auto-connect, if the account has an `ownerJid`, the bridge sends a
 | `autoReconnect` | no | `true` | Reconnect on disconnect |
 | `roomJid` | no | — | Single MUC room JID to join on connect |
 | `autoConnect` | no | `false` | Auto-connect this account on startup |
+| `prompts` | no | — | Partial prompt template overrides (`{placeholder}` syntax) |
+| `uiMessages` | no | — | Partial UI message template overrides (`{placeholder}` syntax) |
 
 ## Extension API
 
